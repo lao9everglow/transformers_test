@@ -20,6 +20,7 @@ from ...configuration_utils import PreTrainedConfig
 from ...utils import auto_docstring
 
 
+# 装饰器语法 等价于 BertConfig = auto_docstring(checkpoint="google-bert/bert-base-uncased")(BertConfig)
 @auto_docstring(checkpoint="google-bert/bert-base-uncased")
 @strict
 class BertConfig(PreTrainedConfig):
@@ -41,7 +42,7 @@ class BertConfig(PreTrainedConfig):
 
     model_type = "bert"
 
-    vocab_size: int = 30522
+    vocab_size: int = 30522 # @strict作用下  def__init__(vocab_size,...): self.vocab_size = vocab_size
     hidden_size: int = 768
     num_hidden_layers: int = 12
     num_attention_heads: int = 12

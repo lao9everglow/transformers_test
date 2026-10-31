@@ -587,6 +587,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
             The desired `torch.dtype` for the loaded tensors. If provided, tensors will be
             converted to this dtype immediately after dequantization to save memory.
     """
+    # 检查 GGUF 和 PyTorch 库是否可用，可用则导入；否则抛出 ImportError
     if is_gguf_available() and is_torch_available():
         from gguf import GGUFReader, dequantize
     else:
@@ -596,23 +597,30 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
         )
         raise ImportError("Please install torch and gguf>=0.10.0 to load a GGUF checkpoint in PyTorch.")
 
+    # 创建 GGUF 文件读取器，获取所有元数据字段和键列表
     reader = GGUFReader(gguf_checkpoint_path)
     fields = reader.fields
+    # 用于跟踪哪些 GGUF 元数据字段已被处理，最终未被处理的键会记录日志，帮助开发者发现映射遗漏
     reader_keys = list(fields.keys())
 
+    # 初始化解析结果字典，按 GGUF_TO_TRANSFORMERS_MAPPING 中的类别分组
     parsed_parameters = {k: {} for k in GGUF_TO_TRANSFORMERS_MAPPING}
 
+    # 从 GGUF 元数据中读取模型架构名称和模型名称
     architecture = read_field(reader, "general.architecture")[0]
     # NOTE: Some GGUF checkpoints may miss `general.name` field in metadata
     model_name = read_field(reader, "general.name")
 
+    # 将 GGUF 中的原始架构名称映射为 Transformers 中使用的统一架构名称
     updated_architecture = None
     # in llama.cpp mistral models use the same architecture as llama. We need
     # to add this patch to ensure things work correctly on our side.
+    # llama.cpp 中 mistral 模型与 llama 共用同一架构，需要根据 model_name 区分
     if "llama" in architecture and "mistral" in model_name:
         updated_architecture = "mistral"
     # FIXME: Currently this implementation is only for flan-t5 architecture.
     # It needs to be developed for supporting legacy t5.
+    # T5 架构需要设置 is_gated_act，并根据 model_name 区分 umt5 和普通 t5
     elif "t5" in architecture or "t5encoder" in architecture:
         parsed_parameters["config"]["is_gated_act"] = True
         if model_name and "umt5" in model_name[0].lower():
@@ -626,6 +634,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
     else:
         updated_architecture = architecture
 
+    # 处理 MoE（混合专家）及其他特殊架构的名称映射
     if "qwen2moe" in architecture:
         updated_architecture = "qwen2_moe"
     elif "gpt_oss" in architecture or "gpt-oss" in architecture:
@@ -638,14 +647,19 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
     # For stablelm architecture, we need to set qkv_bias and use_parallel_residual from tensors
     # If `qkv_bias=True`, qkv_proj with bias will be present in the tensors
     # If `use_parallel_residual=False`, ffn_norm will be present in the tensors
+    # StableLM 架构：通过检测张量中是否存在 attn_qkv 偏置和 ffn_norm 来推断配置参数
+    # 通过张量是否存在反推模型结构是否存在偏置
     if "stablelm" in architecture:
         attn_bias_name = {"attn_q.bias", "attn_k.bias", "attn_v.bias"}
         ffn_norm_name = "ffn_norm"
+        # 如果张量中存在 attn_q.bias/attn_k.bias/attn_v.bias，则 qkv_bias=True
         qkv_bias = any(bias_name in tensor.name for tensor in reader.tensors for bias_name in attn_bias_name)
+        # 如果不存在 ffn_norm 张量，则使用并行残差连接
         use_parallel_residual = any(ffn_norm_name in tensor.name for tensor in reader.tensors)
         parsed_parameters["config"]["use_qkv_bias"] = qkv_bias
         parsed_parameters["config"]["use_parallel_residual"] = not use_parallel_residual
 
+    # 校验架构是否受支持
     if architecture not in GGUF_SUPPORTED_ARCHITECTURES and updated_architecture not in GGUF_SUPPORTED_ARCHITECTURES:
         raise ValueError(f"GGUF model with architecture {architecture} is not supported yet.")
 
@@ -653,6 +667,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
     # tie_word_embeddings is true otherwise false
     exceptions = ["falcon", "bloom"]
     parsed_parameters["config"]["tie_word_embeddings"] = (
+        # 张量中不存在 output.weight(说明输出权重用词嵌入层的) 或者架构在 exceptions 中，就开启词嵌入层权重共享
         all(tensor.name != "output.weight" for tensor in reader.tensors) or architecture in exceptions
     )
 
@@ -664,40 +679,52 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
         parsed_parameters["config"].setdefault(key, value)
 
     # List all key-value pairs in a columnized format
+    # 遍历 GGUF 文件中的所有元数据字段，将其映射并存储到对应的参数类别中
     for gguf_key, field in reader.fields.items():
+        # 将 key 中的原始架构名替换为更新后的架构名
         gguf_key = gguf_key.replace(architecture, updated_architecture)
         split = gguf_key.split(".")
         prefix = split[0]
         config_key = ".".join(split[1:])
 
+        # 解析字段值，支持多值字段
         value = [_gguf_parse_value(field.parts[_data_index], field.types) for _data_index in field.data]
 
+        # 单值字段直接取出，不包装为列表
         if len(value) == 1:
             value = value[0]
 
+        # 如果值是字符串且包含原始架构名，同样替换为更新后的架构名
         if isinstance(value, str) and architecture in value:
             value = value.replace(architecture, updated_architecture)
 
+        # 通过 GGUF_TO_TRANSFORMERS_MAPPING 映射表将 GGUF key 转换为 Transformers 参数
         for parameter, parameter_renames in GGUF_TO_TRANSFORMERS_MAPPING.items():
             if prefix in parameter_renames and config_key in parameter_renames[prefix]:
                 renamed_config_key = parameter_renames[prefix][config_key]
+                # -1 表示该 key 应被忽略（跳过）
                 if renamed_config_key == -1:
                     continue
 
+                # None 或其他值：写入对应的参数类别
                 if renamed_config_key is not None:
                     parsed_parameters[parameter][renamed_config_key] = value
 
+                # 从待处理键列表中移除已处理的 key
                 if gguf_key in reader_keys:
                     reader_keys.remove(gguf_key)
 
+        # 如果该 key 未被任何映射规则处理，记录日志
         if gguf_key in reader_keys:
             logger.info(f"Some keys were not parsed and added into account {gguf_key} | {value}")
 
     # Gemma3 GGUF checkpoint only contains weights of text backbone
+    # Gemma3 的 GGUF 检查点仅包含文本主干的权重，model_type 需标记为 gemma3_text
     if parsed_parameters["config"]["model_type"] == "gemma3":
         parsed_parameters["config"]["model_type"] = "gemma3_text"
 
     # Gemma4 GGUF checkpoint only contains weights of text backbone
+    # Gemma4 的 GGUF 检查点仅包含文本主干的权重，需要额外设置完整的 eos_token_id 列表
     if parsed_parameters["config"]["model_type"] == "gemma4":
         parsed_parameters["config"]["model_type"] = "gemma4_text"
         # GGUF stores a single eos_token_id but Gemma4 needs all three
@@ -706,27 +733,34 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
         parsed_parameters["config"]["eos_token_id"] = [1, 106, 50]
 
     # MiniMax-M2: convert expert_gating_func integer to scoring_func string
+    # MiniMax-M2 架构：将 GGUF 中整数形式的 scoring_func 转换为字符串形式
     if parsed_parameters["config"].get("model_type") == "minimax_m2":
         _gating_func_map = {0: "none", 1: "softmax", 2: "sigmoid"}
         _scoring = parsed_parameters["config"].get("scoring_func")
         if isinstance(_scoring, int):
             parsed_parameters["config"]["scoring_func"] = _gating_func_map.get(_scoring, "softmax")
 
+    # LFM2 架构的特殊处理
     if parsed_parameters["config"]["model_type"] == "lfm2":
         gguf_num_key_value_heads = parsed_parameters["config"]["num_key_value_heads"]
         # LFM2 GGUF checkpoint defines num_key_value_heads as a list of integers .e.g [0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, 8, 0, 8, 0] but we need to set it to the max value for HF
+        # GGUF 中 num_key_value_heads 是一个列表，HF 中需要取最大值
         parsed_parameters["config"]["num_key_value_heads"] = max(gguf_num_key_value_heads)
         ## we already read the correct intermediate_size from the GGUF checkpoint so we need to set block_auto_adjust_ff_dim to False
+        # 已从 GGUF 中正确读取 intermediate_size，需要关闭自动调整
         parsed_parameters["config"]["block_auto_adjust_ff_dim"] = False
 
         ## llama.cpp defines the layers that are full-attention by looking at num_key_value_heads
         ## we need to set the full_attn_idxs to the layers that are full-attention
+        # 根据 num_key_value_heads > 0 判断哪些层使用全注意力
         parsed_parameters["config"]["full_attn_idxs"] = [
             i for i, num_kv_heads in enumerate(gguf_num_key_value_heads) if num_kv_heads > 0
         ]
 
+    # GPT-OSS 架构：从 GGUF 元数据中重建 rope_scaling 配置
     if updated_architecture == "gpt_oss":
         # Helper to read keys with the correct prefix
+        # 辅助函数：从 GGUF 字段中读取带 gpt-oss. 前缀的配置值
         def read_gpt_key(reader, suffix, default=None):
             key = f"gpt-oss.{suffix}"
             if key in reader.fields:
@@ -737,11 +771,13 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
             return default
 
         #  Reconstruct rope_scaling from GGUF metadata
+        # 读取 rope 缩放类型，若不支持则不设置 rope_scaling
         rope_type = read_gpt_key(reader, "rope.scaling.type")
         if rope_type is not None:
             rope_scaling = {"rope_type": rope_type}
 
             # Collect all rope.scaling keys dynamically
+            # 动态收集所有 rope.scaling 相关的键值对
             for key in reader.fields:
                 if not key.startswith("gpt-oss.rope.scaling."):
                     continue
@@ -752,10 +788,12 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
                 if isinstance(value, bytes):
                     value = value.decode("utf-8")
                 # Convert to appropriate type
+                # 根据字段名将值转换为正确的 Python 类型
                 if suffix in ("factor", "attention_factor", "beta_fast", "beta_slow"):
                     value = float(value)
                 elif suffix in ("original_context_length", "original_max_position_embeddings"):
                     # Map GGUF's original_context_length to HF's original_max_position_embeddings
+                    # 将 GGUF 的 original_context_length 映射为 HF 的 original_max_position_embeddings
                     suffix = "original_max_position_embeddings"
                     value = int(value)
                 else:
@@ -766,6 +804,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
 
     # retrieve config vocab_size from tokenizer
     # Please refer to https://github.com/huggingface/transformers/issues/32526 for more details
+    # 如果配置中缺少 vocab_size，从 tokenizer 的 tokens 列表中推断
     if "vocab_size" not in parsed_parameters["config"]:
         tokenizer_parameters = parsed_parameters["tokenizer"]
         if "tokens" in tokenizer_parameters:
@@ -776,20 +815,26 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
                 "This will use default value from model config class and cause unexpected behavior."
             )
 
+    # 如果需要加载张量权重，则进行反量化和名称映射
     if return_tensors:
         parsed_parameters["tensors"] = {}
 
         config = parsed_parameters.get("config", {})
 
+        # 根据架构选择对应的张量处理器（用于特殊的张量合并/拆分逻辑）
         ProcessorClass = TENSOR_PROCESSORS.get(architecture, TensorProcessor)
         processor = ProcessorClass(config=config)
 
+        # 获取 GGUF 张量名到 HF 参数名的映射表
         tensor_key_mapping = get_gguf_hf_weights_map(model_to_load, processor)
 
+        # 遍历所有张量，进行反量化、处理和映射
         for tensor in tqdm(reader.tensors, desc="Converting and de-quantizing GGUF tensors..."):
             name = tensor.name
+            # 将 GGUF 量化张量反量化为 NumPy 数组
             weights = dequantize(tensor.data, tensor.tensor_type)
 
+            # 通过处理器对张量进行架构特定的处理（如合并 QKV、拆分等）
             result = processor.process(
                 weights=weights,
                 name=name,
@@ -800,16 +845,20 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
             weights = result.weights
             name = result.name
 
+            # 如果处理后的张量名不在映射表中，跳过该张量
             if name not in tensor_key_mapping:
                 continue
 
+            # 将 GGUF 张量名映射为 HF 参数名
             name = tensor_key_mapping[name]
 
+            # 转换为 PyTorch 张量，并根据需要转换数据类型
             tensor = torch.from_numpy(np.copy(weights))
             if torch_dtype is not None:
                 tensor = tensor.to(torch_dtype)
             parsed_parameters["tensors"][name] = tensor
 
+    # 如果还有未处理的 GGUF 键，记录日志
     if len(reader_keys) > 0:
         logger.info(f"Some keys of the GGUF file were not considered: {reader_keys}")
 

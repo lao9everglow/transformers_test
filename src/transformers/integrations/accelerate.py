@@ -95,7 +95,12 @@ def check_and_set_device_map(device_map: "torch.device | int | str | dict | None
     from ..modeling_utils import get_torch_context_manager_or_global_device
 
     # Potentially detect context manager or global device, and use it (only if no device_map was provided)
-    if device_map is None and not is_deepspeed_zero3_enabled():
+    # deepspeed zero3 要求模型必须先在 CPU 上构建 / 加载，由 DeepSpeed 内部负责参数分片；
+    # 如果 transformers 提前把权重拷进 GPU，会破坏 ZeRO3 参数分片机制，引发 OOM、权重错乱、通信报错
+    if device_map is None and not is_deepspeed_zero3_enabled():    
+        # get_torch_context_manager_or_global_device() 创建一个临时张量，获取该张量的上下文A，对比上下文A和 torch.get_default_device() 默认上下文B。
+        # 如果AB相同，且默认上下文B不是cpu，则返回默认上下文B，否则返回None。两者不同时返回临时上下文A。
+        # 作用：当用户没有传入 device_map 时，自动推断模型应该加载到哪个设备
         device_in_context = get_torch_context_manager_or_global_device()
         if device_in_context == torch.device("meta"):
             raise RuntimeError(
@@ -106,6 +111,7 @@ def check_and_set_device_map(device_map: "torch.device | int | str | dict | None
         device_map = device_in_context
 
     # change device_map into a map if we passed an int, a str or a torch.device
+    # 如果传入的参数是 int、str、torch.device，就将 device_map 参数改变成映射
     if isinstance(device_map, torch.device):
         device_map = {"": device_map}
     elif isinstance(device_map, str) and device_map not in ["auto", "balanced", "balanced_low_0", "sequential"]:

@@ -55,19 +55,25 @@ class BertEmbeddings(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        # vocab_size词表大小， hidden_size输出/语义向量维度
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        # max_position_embeddings 最大序列长度
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        # type_vocab_size 第一句第二句，双句任务
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # 存在buffer上的数据不参与梯度更新，不可训练。   buffer数据会随着device移动。
+        # persistent=False 说明 state_dict() 时不导出该数据，加载权重时也不需要该数据
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.register_buffer(
             "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
-        )
+        ) # 位置索引，标记每个 token 在序列里的位置
         self.register_buffer(
             "token_type_ids", torch.zeros(self.position_ids.size(), dtype=torch.long), persistent=False
-        )
+        ) # 句子类型索引，标记这个 token 属于第几个句子
 
     def forward(
         self,
@@ -152,6 +158,7 @@ class BertSelfAttention(nn.Module):
 
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        # all_head_size等于hidden_size
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         self.scaling = self.attention_head_size**-0.5
 
@@ -301,9 +308,14 @@ class BertAttention(nn.Module):
     def __init__(self, config, is_causal=False, layer_idx=None, is_cross_attention=False):
         super().__init__()
         self.is_cross_attention = is_cross_attention
+        # Bert 本身是没有 decoder 部分，即没有交叉注意力机制的。下面的 BertCrossAttention 是 Bert 衍生场景
+        # 三大场景：1、BERT 衍生编解码模型（机器翻译、摘要、问答生成）；
+        #          2、多模态 BERT（图文对齐、VQA、图文生成）
+        #          3、阅读理解 / 检索增强生成 RAG（自定义双层 BERT 融合）
+        # BertCrossAttention 和 BertSelfAttention 的初始化跟普通 Transformer 的 MultiHeadedAttention 几乎一样，差异主要在 forward
         attention_class = BertCrossAttention if is_cross_attention else BertSelfAttention
         self.self = attention_class(config, is_causal=is_causal, layer_idx=layer_idx)
-        self.output = BertSelfOutput(config)
+        self.output = BertSelfOutput(config) # 全连接层 -> dropout -> layernorm
 
     def forward(
         self,
@@ -354,17 +366,18 @@ class BertOutput(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
-
-class BertLayer(GradientCheckpointingLayer):
+# GradientCheckpointingLayer 只有在 model.set_gradient_checkpointing() 时触发
+# 作用跟 BertModel 类定义的 gradient_checkpointing 变量作用一样
+class BertLayer(GradientCheckpointingLayer): 
     def __init__(self, config, layer_idx=None):
         super().__init__()
-        self.chunk_size_feed_forward = config.chunk_size_feed_forward
-        self.seq_len_dim = 1
-        self.attention = BertAttention(config, is_causal=config.is_decoder, layer_idx=layer_idx)
+        self.chunk_size_feed_forward = config.chunk_size_feed_forward # 长序列时分几块进行FFN，0时不分块
+        self.seq_len_dim = 1 # 固定维度标记，序列长度在 tensor 第 1 维 [batch, seq_len, hidden]
+        self.attention = BertAttention(config, is_causal=config.is_decoder, layer_idx=layer_idx) # 这里是 BertSelfAttention
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
-        if self.add_cross_attention:
-            if not self.is_decoder:
+        if self.add_cross_attention: # 如果有增加交叉注意力标识就需要解码器
+            if not self.is_decoder: # BertAttention 内会走到 BertCrossAttention，而不是 BertSelfAttention
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
             self.crossattention = BertAttention(
                 config,
@@ -372,8 +385,8 @@ class BertLayer(GradientCheckpointingLayer):
                 layer_idx=layer_idx,
                 is_cross_attention=True,
             )
-        self.intermediate = BertIntermediate(config)
-        self.output = BertOutput(config)
+        self.intermediate = BertIntermediate(config) # Linear -> activate_fn
+        self.output = BertOutput(config) # linear -> dropout -> layernorm
 
     def forward(
         self,
@@ -456,12 +469,12 @@ class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.activation = nn.Tanh()
+        self.activation = nn.Tanh() # 值域(-1, 1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
-        first_token_tensor = hidden_states[:, 0]
+        first_token_tensor = hidden_states[:, 0] # 每条样本的第一个位置，即 Bert 的 [CLS]
         pooled_output = self.dense(first_token_tensor)
         pooled_output = self.activation(pooled_output)
         return pooled_output
@@ -550,10 +563,16 @@ class BertPreTrainedModel(PreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module):
         """Initialize the weights"""
-        super()._init_weights(module)
+        super()._init_weights(module) # 执行 PreTrainedModel 的 _init_weights，初始化通用层权重
+        # bertModel 自己额外需要初始化的权重处理
         if isinstance(module, BertLMPredictionHead):
             init.zeros_(module.bias)
         elif isinstance(module, BertEmbeddings):
+            # BertEmbeddings的构造器init时也有类似代码。作用是注册 buffer 变量名到模块；给 buffer 赋初始默认值；分配张量存储空间
+            # persistent=False 说明 state_dict() 时不导出该数据，加载权重时也不需要该数据
+            # self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False)   
+            # self.register_buffer("token_type_ids", torch.zeros(self.position_ids.size(), dtype=torch.long), persistent=False)
+            # 当前方法是全部子模块构建完成后调用的，负责标准化填充正确数值，兜底修复错乱、空 meta 张量、resize 后的不匹配问题
             init.copy_(module.position_ids, torch.arange(module.position_ids.shape[-1]).expand((1, -1)))
             init.zeros_(module.token_type_ids)
 
@@ -596,24 +615,27 @@ class BertForPreTrainingOutput(ModelOutput):
     """
 )
 class BertModel(BertPreTrainedModel):
-    _no_split_modules = ["BertEmbeddings", "BertLayer"]
+    _no_split_modules = ["BertEmbeddings", "BertLayer"] # 不允许跨设备拆分的模块声明
 
     def __init__(self, config, add_pooling_layer=True):
         r"""
         add_pooling_layer (bool, *optional*, defaults to `True`):
             Whether to add a pooling layer
         """
-        super().__init__(config)
+        super().__init__(config) # 调用 PreTrainedModel 的 __init__()   config是PreTrainedConfig子类
         self.config = config
+        # 用来判断是否存储梯度中间值的开关。False时关闭梯度检查点，完整缓存所有层激活，默认训练行为
         self.gradient_checkpointing = False
 
+        # BertEmbeddings内有三个embedding：word_embeddings(需学习，词维度)、position_embeddings(不学习，位置信息)、token_type_embeddings(不学习，双句任务)
         self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
+        self.encoder = BertEncoder(config) # 就是 12 层的Transformer Encoder Layer，Layer 内部多一些bert逻辑
 
-        self.pooler = BertPooler(config) if add_pooling_layer else None
+        # BertPooler会取出输入序列的 [CLS] 向量，经过一层可学习全连接 + Tanh 激活，生成整句统一表征，专门供给文本分类、下一句预测这类句子级任务使用
+        self.pooler = BertPooler(config) if add_pooling_layer else None # linear -> tanh 值域(-1, 1)
 
         # Initialize weights and apply final processing
-        self.post_init()
+        self.post_init() # PreTrainedModel的方法，方法内部提供一些公共的模块初始化，当前模型也可以实现特定模块初始化
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings

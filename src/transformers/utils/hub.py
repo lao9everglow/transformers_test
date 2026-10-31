@@ -434,7 +434,7 @@ def cached_files(
     try:
         if len(full_filenames) == 1:
             # This is slightly better for only 1 file
-            hf_hub_download(
+            hf_hub_download( # 下载单个文件。轻量，适合单独取 gguf、config.json
                 path_or_repo_id,
                 filenames[0],
                 subfolder=None if len(subfolder) == 0 else subfolder,
@@ -448,7 +448,7 @@ def cached_files(
                 local_files_only=local_files_only,
                 tqdm_class=tqdm_class,
             )
-        else:
+        else: # 下载整个仓库/子目录全部文件。批量拉取所有权重、分词文件
             snapshot_download(
                 path_or_repo_id,
                 allow_patterns=full_filenames,

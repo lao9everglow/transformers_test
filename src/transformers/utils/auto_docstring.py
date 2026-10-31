@@ -2719,7 +2719,7 @@ def get_model_name(obj):
     Get the model name from the file path of the object.
     """
 
-    path = inspect.getsourcefile(obj)
+    path = inspect.getsourcefile(obj) # 传入类、函数、方法对象，返回定义它的 .py 文件绝对路径
     if path is None:
         return None
     if path.split(os.path.sep)[-3] != "models":
@@ -4176,21 +4176,25 @@ def auto_method_docstring(
 def auto_class_docstring(cls, custom_intro=None, custom_args=None, checkpoint=None):
     """
     Wrapper that automatically generates a docstring for classes based on their attributes and methods.
+    custom_intro: 自定义开头介绍文案
+    custom_args: 手动补充/覆盖参数
+    checkpoint: 预训练模型标识字符串，用于拉取官方参数注释
     """
-    # import here to avoid circular import
+    # import here to avoid circular import 延迟导入，解决循环依赖。AutoModel、AutoConfig也会导入，避免循环导入
     from transformers.models import auto as auto_module
 
-    is_dataclass = False
-    is_processor = False
-    is_config = False
-    is_image_processor = False
+    is_dataclass = False        
+    is_processor = False        # 是否文本处理
+    is_config = False           # 是否配置类
+    is_image_processor = False  # 是否图片处理
     docstring_init = ""
     docstring_args = ""
-    if "PreTrainedModel" in (x.__name__ for x in cls.__mro__):
+    # cls.__mro__是内置属性（Method Resolution Order），返回元组，元素是父类，用于多继承时确定属性/方法先去哪个父类找
+    if "PreTrainedModel" in (x.__name__ for x in cls.__mro__): # 类继承自 PreTrainedModel 就会进入
         docstring_init = auto_method_docstring(
             cls.__init__, parent_class=cls, custom_args=custom_args, checkpoint=checkpoint
         ).__doc__.replace("Args:", "Parameters:")
-    elif "ProcessorMixin" in (x.__name__ for x in cls.__mro__):
+    elif "ProcessorMixin" in (x.__name__ for x in cls.__mro__): # 类继承自 ProcessorMixin 就会进入
         is_processor = True
         docstring_init = auto_method_docstring(
             cls.__init__,
@@ -4199,7 +4203,7 @@ def auto_class_docstring(cls, custom_intro=None, custom_args=None, checkpoint=No
             checkpoint=checkpoint,
             source_args_dict=get_args_doc_from_source([ModelArgs, ImageProcessorArgs, ProcessorArgs]),
         ).__doc__.replace("Args:", "Parameters:")
-    elif "ModelOutput" in (x.__name__ for x in cls.__mro__):
+    elif "ModelOutput" in (x.__name__ for x in cls.__mro__): # 类继承自 ModelOutput 就会进入
         # We have a data class
         is_dataclass = True
         doc_class = cls.__doc__
@@ -4232,7 +4236,7 @@ def auto_class_docstring(cls, custom_intro=None, custom_args=None, checkpoint=No
             checkpoint=checkpoint,
             source_args_dict=get_args_doc_from_source(ModelOutputArgs),
         ).__doc__
-    elif any("BaseImageProcessor" in x.__name__ for x in cls.__mro__):
+    elif any("BaseImageProcessor" in x.__name__ for x in cls.__mro__): # 类继承自 BaseImageProcessor 就会进入
         is_image_processor = True
         docstring_init = auto_method_docstring(
             cls.__init__,
@@ -4241,7 +4245,7 @@ def auto_class_docstring(cls, custom_intro=None, custom_args=None, checkpoint=No
             checkpoint=checkpoint,
             source_args_dict=get_args_doc_from_source(ImageProcessorArgs),
         ).__doc__
-    elif "PreTrainedConfig" in (x.__name__ for x in cls.__mro__):
+    elif "PreTrainedConfig" in (x.__name__ for x in cls.__mro__): # 类继承自 PreTrainedConfig 就会进入
         is_config = True
         doc_class = cls.__doc__
         if custom_args is None and doc_class:
@@ -4252,6 +4256,8 @@ def auto_class_docstring(cls, custom_intro=None, custom_args=None, checkpoint=No
         # config base classes to be documented, while naturally excluding PreTrainedConfig-specific
         # quasi-ClassVar params (e.g. `transformers_version`, `architectures`).
         own_config_params = set()
+        # cls.__mro__遍历类的父级元素（有优先级顺序），直到PreTrainedConfig。
+        # 如果父级类声明了变量且该变量不是静态常量就加到own_config_params。（只有模型超参才加到文档中）
         for ancestor in cls.__mro__:
             if ancestor.__name__ == "PreTrainedConfig":
                 break
@@ -4524,14 +4530,15 @@ def auto_docstring(obj=None, *, custom_intro=None, custom_args=None, checkpoint=
     """
 
     def auto_docstring_decorator(obj):
-        if len(obj.__qualname__.split(".")) > 1:
+        # __qualname__ 内置属性，相比__name__会返回完整层级名称
+        if len(obj.__qualname__.split(".")) > 1: # 说明是类名.方法，调用给方法加文档的方法
             return auto_method_docstring(
                 obj, custom_args=custom_args, custom_intro=custom_intro, checkpoint=checkpoint
             )
-        else:
+        else: # 说明是类名，调用给类加文档的方法
             return auto_class_docstring(obj, custom_args=custom_args, custom_intro=custom_intro, checkpoint=checkpoint)
 
     if obj:
         return auto_docstring_decorator(obj)
 
-    return auto_docstring_decorator
+    return auto_docstring_decorator # 自动把类对象BertConfig（以Bert初始化配置为例）作为唯一实参传给auto_docstring_decorator

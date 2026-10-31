@@ -60,8 +60,10 @@ def initialize_tensor_parallelism(
     This function is called when the model is loaded and the TP plan is set to 'auto'.
     """
     if tp_size is not None and tp_plan is None:
+        # tp_size 不为 None，tp_plan 为 None，则抛出异常
         raise ValueError("tp_plan has to be set when tp_size is passed.")
     if tp_plan is not None and device_map is not None:
+        # 这两个参数是互斥的，只能选择一个
         raise ValueError("`tp_plan` and `device_map` are mutually exclusive. Choose either one for parallelization.")
     if device_mesh is None:
         if not is_torch_greater_or_equal("2.5"):
@@ -70,21 +72,24 @@ def initialize_tensor_parallelism(
         # Detect the accelerator on the machine. If no accelerator is available, it returns CPU.
         device_type = torch._C._get_accelerator().type
         if device_type == "mps":
+            # 苹果不支持张量并行
             raise RuntimeError("Tensor parallelism is not supported on MPS devices.")
         current_device = getattr(torch, device_type)
         if not torch.distributed.is_initialized():
+            # 进程组尚未初始化，则自动尝试初始化分布式
             try:
                 rank = int(os.environ["RANK"])
+                # 读环境变量
                 local_rank = int(os.environ["LOCAL_RANK"])
                 world_size = int(os.environ["WORLD_SIZE"])
 
                 backend_map = {
-                    "cuda": "nccl",
-                    "cpu": "gloo",
-                    "xpu": "xccl",
-                    "hpu": "hccl",
-                    "neuron": "neuron",
-                    "tpu": "tpu_dist",
+                    "cuda": "nccl",     # NVIDIA GPU 标准分布式通信库
+                    "cpu": "gloo",      # CPU 集群通信后端
+                    "xpu": "xccl",      # Intel XPU 对应的通信库
+                    "hpu": "hccl",      # Habana Gaudi HPU 专用通信库
+                    "neuron": "neuron", # AWS Trainium/Inferentia Neuron 芯片通信后端
+                    "tpu": "tpu_dist",  # Google TPU 分布式通信实现
                 }
                 backend = backend_map.get(device_type)
 

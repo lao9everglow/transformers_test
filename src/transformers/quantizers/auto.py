@@ -328,21 +328,29 @@ def register_quantizer(name: str):
 
 
 def get_hf_quantizer(config, quantization_config, device_map, weights_only, user_agent):
+    # pre_quantized 预量化标识。
+    # True 权重文件本身就是量化权重（GPTQ/AWQ 预量化模型，模型仓库保存了量化权重），权重磁盘上就是压缩量化格式，加载后直接加载量化张量
+    # False 原始浮点权重，运行时动态量化，磁盘 fp16/bf16，加载进显存后实时量化
     quantization_params_from_config = getattr(config, "quantization_config", None) or getattr(
         config.get_text_config(decoder=True), "quantization_config", None
     )
     pre_quantized = quantization_params_from_config is not None
+    # 校验传入的 quantization_config.quant_method 量化方法是否在 AUTO_QUANTIZATION_CONFIG_MAPPING 映射中，匹配才能量化
     if pre_quantized and not AutoHfQuantizer.supports_quant_method(quantization_params_from_config):
         pre_quantized = False
 
     if pre_quantized or quantization_config is not None:
         if pre_quantized:
+            # 合并 模型自带量化配置 和 用户额外传入量化的参数
             config.quantization_config = AutoHfQuantizer.merge_quantization_configs(
                 quantization_params_from_config, quantization_config
             )
         else:
             config.quantization_config = quantization_config
 
+        # config.quantization_config 如果是dict就用自动工厂函数实例化对应的量化config对象
+        # 进行一些量化方法字段拼接、是否在 AUTO_QUANTIZER_MAPPING 映射的判断
+        # 调用对应量化方法类的实例化方法，最终返回对应的量化方法类实例
         hf_quantizer = AutoHfQuantizer.from_config(
             config.quantization_config,
             pre_quantized=pre_quantized,
@@ -351,10 +359,12 @@ def get_hf_quantizer(config, quantization_config, device_map, weights_only, user
         hf_quantizer = None
 
     if hf_quantizer is not None:
+        # 校验硬件、依赖、参数兼容性
         hf_quantizer.validate_environment(
             device_map=device_map,
             weights_only=weights_only,
         )
+        # 量化器根据自身规则修正 device_map、tp_plan(张量并行)、ep_plan(MoE并行)
         device_map = hf_quantizer.update_device_map(device_map)
         config = hf_quantizer.update_tp_plan(config)
         config = hf_quantizer.update_ep_plan(config)

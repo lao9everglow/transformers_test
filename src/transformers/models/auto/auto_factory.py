@@ -260,20 +260,24 @@ class _BaseAutoModelClass:
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike[str], *model_args, **kwargs):
         config = kwargs.pop("config", None)
-        trust_remote_code = kwargs.get("trust_remote_code")
-        kwargs["_from_auto"] = True
-        hub_kwargs_names = [
-            "cache_dir",
-            "force_download",
-            "local_files_only",
-            "proxies",
-            "revision",
-            "subfolder",
-            "token",
+        trust_remote_code = kwargs.get("trust_remote_code") # 是否信任仓库自定义代码
+        kwargs["_from_auto"] = True # 标记当前模型是通过 AutoModel 自动加载，而非直接 LlamaForCausalLM(...) 手动实例化
+        hub_kwargs_names = [    # hf hub下载相关参数列表
+            "cache_dir",        # 模型缓存目录
+            "force_download",   # 强制重新下载，不走本地缓存
+            "local_files_only", # 仅使用本地文件，禁止联网拉取仓库
+            "proxies",          # 下载代理配置
+            "revision",         # 仓库版本分支/tag/commit
+            "subfolder",        # 仓库内子文件夹加载（如 text_encoder）
+            "token",            # HF 登录令牌，访问私有模型
         ]
+        # 上面列表里所有参数只负责文件下载、仓库访问，和模型权重初始化、推理参数无关，需要单独剥离。让 kwargs 只剩模型初始化参数
         hub_kwargs = {name: kwargs.pop(name) for name in hub_kwargs_names if name in kwargs}
-        code_revision = kwargs.pop("code_revision", None)
-        commit_hash = kwargs.pop("_commit_hash", None)
+        # 单独控制自定义模型代码文件（modeling.py） 的版本，和权重版本可分离
+        code_revision = kwargs.pop("code_revision", None)   
+        # 内部缓存用，记录本次加载的完整 commit 哈希，用于缓存校验、日志打印
+        commit_hash = kwargs.pop("_commit_hash", None)      
+        # 专门存放适配器加载参数：LoRA 权重路径、适配器缩放、融合开关等。分离后，后续逻辑单独处理适配器加载，不会污染主模型初始化参数
         adapter_kwargs = kwargs.pop("adapter_kwargs", None)
 
         token = hub_kwargs.pop("token", None)
@@ -283,7 +287,8 @@ class _BaseAutoModelClass:
 
         if commit_hash is None:
             if not isinstance(config, PreTrainedConfig):
-                # We make a call to the config file first (which may be absent) to get the commit hash as soon as possible
+                # We make a call to the config file first (which may be absent不存在) to get the commit hash as soon as possible
+                # 返回路径形如 '/root/.cache/huggingface/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/config.json'
                 resolved_config_file = cached_file(
                     pretrained_model_name_or_path,
                     CONFIG_NAME,
@@ -291,18 +296,22 @@ class _BaseAutoModelClass:
                     _raise_exceptions_for_missing_entries=False,
                     _raise_exceptions_for_connection_errors=False,
                     **hub_kwargs,
-                )
-                commit_hash = extract_commit_hash(resolved_config_file, commit_hash)
+                ) 
+                commit_hash = extract_commit_hash(resolved_config_file, commit_hash) 
             else:
                 commit_hash = getattr(config, "_commit_hash", None)
-
-        if is_peft_available():
+                
+        # PEFT库(Parameter-Efficient Fine-Tuning，HuggingFace官方配套库，参数高效微调)
+        # 支持主流微调方案：LoRA(最常用)、IA3 / AdaLoRA / LoHa / LoKr、Prompt Tuning / Prefix Tuning / P-Tuning v2等等
+        if is_peft_available(): 
             if adapter_kwargs is None:
                 adapter_kwargs = {}
-            adapter_kwargs = adapter_kwargs.copy()  # avoid mutating original
+            adapter_kwargs = adapter_kwargs.copy()
+            # avoid mutating original 避免修改原始对象
             if token is not None:
                 adapter_kwargs["token"] = token
 
+            # 简单校验存于 hf Hub 或本地的模型是否为适配器模型；若是，则返回适配器配置文件路径，否则返回空值
             maybe_adapter_path = find_adapter_config_file(
                 pretrained_model_name_or_path, _commit_hash=commit_hash, **adapter_kwargs
             )
@@ -316,6 +325,8 @@ class _BaseAutoModelClass:
                     # complete model with an embedded adapter so that local models with embedded
                     # adapters will load from the local base model rather than pull the base
                     # model named in the adapter's config from the hub.
+                    # 当且仅当当前值不指向一个包含嵌入适配器的完整模型时，才覆盖模型名称/路径，
+                    # 以便本地模型包含嵌入适配器时，从本地基模型加载，而不是从hub拉取适配器配置文件中指定的基模型
                     if not os.path.exists(pretrained_model_name_or_path) or not os.path.exists(
                         os.path.join(pretrained_model_name_or_path, CONFIG_NAME)
                     ):
@@ -323,16 +334,31 @@ class _BaseAutoModelClass:
 
         if not isinstance(config, PreTrainedConfig):
             kwargs_orig = copy.deepcopy(kwargs)
-            # ensure not to pollute the config object with dtype="auto" - since it's
+            # ensure not to pollute（污染） the config object with dtype="auto" - since it's
             # meaningless in the context of the config object - torch.dtype values are acceptable
-            if kwargs.get("torch_dtype") == "auto":
+            # 确保不污染 config 对象，因为 dtype="auto" 在 config 对象的上下文中没有意义 - torch.dtype 值是可接受的
+            if kwargs.get("torch_dtype") == "auto": # 只会接受 dtype=torch.bfloat16 这种参数，auto 的不接受
                 _ = kwargs.pop("torch_dtype")
-            if kwargs.get("dtype") == "auto":
+            if kwargs.get("dtype") == "auto": # 同理
                 _ = kwargs.pop("dtype")
             # to not overwrite the quantization_config if config has a quantization_config
             if kwargs.get("quantization_config") is not None:
+                # 这些pop掉的参数都是以对应config为准的
                 _ = kwargs.pop("quantization_config")
 
+            # 根据 pretrained_model_name_or_path 读取配置参数
+            # 有 gguf_file 就读取
+            #   读取配置好进行一些模型字段映射处理(architecture、model_type)，根据参数反推模型架构(例如输入有embedding但是输出没有 -> 共享权重)
+            #   对读取到的张量反量化，反量化后用对应架构/模型的张量处理器进行：
+            #       1、权重维度转置（gguf存的是[out_dim,in_dim]，模型要[in_dim,out_dim]；存的权重需要转置）
+            #       2、张量的拆分/合并处理（算子融合存储）
+            #   满足类型转换的张量进行转换，满足映射表的张量进行映射(gguf 张量名跟模型参数名会不一致，需要映射)
+            #   没处理到的 gguf 键存到日志，方便排查
+            # 没有就读取 本地文件/本地缓存/hf hub 的 config.json
+            #   有一些前置的拼接user_agent操作，用于请求hub
+            #   对config.json读取到的数据进行处理(Infinity/NAN转成python支持的inf和nan)
+            # 上面读取到的配置如果没有 model_type，且模型是 timm models -> model_type = timm_wrapper (timm开源Python库，专门提供海量预训练图像骨干网络)
+            # 用户传入了model_type，且与config的model_type不一致时，覆写并提示
             config, kwargs = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
                 return_unused_kwargs=True,
@@ -341,10 +367,12 @@ class _BaseAutoModelClass:
                 **hub_kwargs,
                 **kwargs,
             )
+            # 返回模型配置对象和未使用的、过滤掉config已使用的参数(用来实例化模型用)
 
             # A concrete dtype is absorbed into the config above and then dropped at the composite
             # `get_text_config()` swap, so re-inject the user's value as an explicit kwarg to force the model's
             # `from_pretrained` to honor it over the config's saved dtype (#46459).
+            # 将原始 kwargs 中的这三个变量重新赋值回 kwargs 中
             if kwargs_orig.get("torch_dtype", None) is not None:
                 kwargs["torch_dtype"] = kwargs_orig["torch_dtype"]
             if kwargs_orig.get("dtype", None) is not None:
@@ -354,9 +382,11 @@ class _BaseAutoModelClass:
 
         has_remote_code = hasattr(config, "auto_map") and cls.__name__ in config.auto_map
         has_local_code = type(config) in cls._model_mapping
+        # cls._model_mapping有可能是一对一映射，也有可能是一对多list/tuple，后者需要遍历。_get_model_class就是处理这个的
         explicit_local_code = has_local_code and not _get_model_class(
             config, cls._model_mapping
         ).__module__.startswith("transformers.")
+        # 存在本地代码，且不是transformers模块的代码   
         upstream_repo = None
         if has_remote_code:
             class_ref = config.auto_map[cls.__name__]
@@ -369,27 +399,38 @@ class _BaseAutoModelClass:
             has_remote_code,
             upstream_repo=upstream_repo,
         )
+        # 对远程自定义代码做安全提醒与用户确认，最终输出是否允许执行仓库内自定义模型代码的布尔开关
         kwargs["trust_remote_code"] = trust_remote_code
 
         # Set the adapter kwargs
         kwargs["adapter_kwargs"] = adapter_kwargs
 
+        # hf hub 存在 modeling_*.py / configuration_*.py 自定义脚本  +  信任远程代码，允许动态下载并执行外部 Python 脚本  +  不是优先使用本地目录的自定义脚本
         if has_remote_code and trust_remote_code and not explicit_local_code:
             model_class = get_class_from_dynamic_module(
                 class_ref, pretrained_model_name_or_path, code_revision=code_revision, **hub_kwargs, **kwargs
-            )
+            ) # 下载第三方 Python 源码并执行，返回对应类
             _ = hub_kwargs.pop("code_revision", None)
+            # 添加注册表映射，避免重复下载。config类: 模型类。后续再调用时就不需要再次下载脚本，直接从注册表找
             cls.register(config.__class__, model_class, exist_ok=True)
+            # 将模型类注册到对应 auto 容器，也是便于后续复用。
             model_class.register_for_auto_class(auto_class=cls)
-            model_class = add_generation_mixin_to_remote_model(model_class)
+            # 对没有继承 GenerationMixin 的 pytorch 模型进行兼容性处理，内含type()传三参数创建类的代码
+            # type三参数用法是动态创建类，分别对应新类类名、多重继承基类列表(MRO method resolution order相关)、浅拷贝原类的命名空间(类方法、类变量、property等)放进新类
+            model_class = add_generation_mixin_to_remote_model(model_class) # 第二个参数会加上 GenerationMixin 类
             return model_class.from_pretrained(
                 pretrained_model_name_or_path, *model_args, config=config, **hub_kwargs, **kwargs
             )
-        elif has_local_code:
+        elif has_local_code: # cls._model_mapping 存在当前配置的映射
+            # cls._model_mapping 是在模块导入时，每个官方模型底部都有注册代码，例如 LlamaForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+            # 另一种就是运行时动态赋值，上面的 model_class.register_for_auto_class
             model_class = _get_model_class(config, cls._model_mapping)
+            # 多模态符合模型 config 结构 { "architectures": ["LlavaForConditionalGeneration"], text_config: { 文本部分配置 }, vision_config: { 视觉部分配置 } }
+            # 在 PretrainedConfig 中提供 sub_configs 字段，用于存储子模型配置，例如 text_config 和 vision_config
             text_config_class = config.sub_configs.get("text_config", None)
             # getattr avoids AttributeError, as registered remote-code model classes may lack config_class
             if text_config_class is not None and getattr(model_class, "config_class", None) == text_config_class:
+                # 子模块存在文本部分配置，且主模型类配置类与文本部分配置类相同，则将文本部分配置作为模型类配置对象
                 # TODO: Validate that copying the parent quantization config to the text sub-config preserves
                 # modules_to_not_convert and skip-module matching when composite-model module prefixes differ.
                 parent_config = config
@@ -398,6 +439,7 @@ class _BaseAutoModelClass:
                 # as a `config.json` can have `"quantization_config": null` in it
                 parent_quant = getattr(parent_config, "quantization_config", None)
                 if parent_quant is not None:
+                # 子模块可能没有量化配置，这里需要覆盖一下
                     config.quantization_config = parent_quant
             return model_class.from_pretrained(
                 pretrained_model_name_or_path, *model_args, config=config, **hub_kwargs, **kwargs
@@ -560,14 +602,14 @@ def add_generation_mixin_to_remote_model(model_class):
     # `prepare_inputs_for_generation` method.
     has_custom_generate_in_class = hasattr(model_class, "generate") and "GenerationMixin" not in str(
         getattr(model_class, "generate")
-    )
+    ) # 模型实现了 generate 方法，但是没有继承 GenerationMixin
     has_custom_prepare_inputs = hasattr(model_class, "prepare_inputs_for_generation") and "GenerationMixin" not in str(
         getattr(model_class, "prepare_inputs_for_generation")
-    )
+    ) # 模型实现了 prepare_inputs_for_generation 方法，但是没有继承 GenerationMixin
     if has_custom_generate_in_class or has_custom_prepare_inputs:
         model_class_with_generation_mixin = type(
             model_class.__name__, (model_class, GenerationMixin), {**model_class.__dict__}
-        )
+        ) # type三参数用法是动态创建类，分别对应新类类名、多重继承基类列表(MRO method resolution order相关)、浅拷贝原类的命名空间(类方法、类变量、property等)放进新类
         return model_class_with_generation_mixin
     return model_class
 

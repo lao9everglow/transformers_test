@@ -265,6 +265,9 @@ def get_torch_context_manager_or_global_device():
     Test if a device context manager is currently in use, or if it is not the case, check if the default device
     is not "cpu". This is used to infer the correct device to load the model on, in case `device_map` is not provided.
     """
+    # 创建一个临时张量，获取该张量的上下文A，对比上下文A和torch默认上下文B。
+    # 如果AB相同，且默认上下文B不是cpu，则返回默认上下文B，否则返回None。两者不同时返回临时上下文A。
+    # 作用：当用户没有传入 device_map 时，自动推断模型应该加载到哪个设备
     device_in_context = torch.tensor([]).device
     default_device = torch.get_default_device()
     # This case means no context manager was used -> we still check if the default that was potentially set is not cpu
@@ -554,10 +557,10 @@ def _get_resolved_checkpoint_files(
     pretrained_model_name_or_path: str | os.PathLike | None,
     variant: str | None,
     gguf_file: str | None,
-    use_safetensors: bool | None,
+    use_safetensors: bool | None, # True只用safetensors False只用pickle None先safetensors后pickle
     user_agent: dict | None,
     is_remote_code: bool,  # Because we can't determine this inside this function, we need it to be passed in
-    transformers_explicit_filename: str | None = None,
+    transformers_explicit_filename: str | None = None, # 这个参数优先级最高，清晰明确的文件名
     download_kwargs: DownloadKwargs | None = None,
     tqdm_class: type | None = None,
 ) -> tuple[list[str] | None, dict | None]:
@@ -574,7 +577,7 @@ def _get_resolved_checkpoint_files(
     revision = download_kwargs.get("revision") or "main"
     subfolder = download_kwargs.get("subfolder", "")
     commit_hash = download_kwargs.get("commit_hash")
-    if transformers_explicit_filename is not None:
+    if transformers_explicit_filename is not None: # 校验文件名是否合法
         if not transformers_explicit_filename.endswith(".safetensors") and not transformers_explicit_filename.endswith(
             ".safetensors.index.json"
         ):
@@ -585,61 +588,75 @@ def _get_resolved_checkpoint_files(
                     f"{transformers_explicit_filename}"
                 )
 
-    is_sharded = False
-
+    is_sharded = False # 用来判断当前找到的权重文件是不是【分片索引文件】
+    
+    # 分支一 标准HF模型分支（bin/safetensors，非GGUF）
     if pretrained_model_name_or_path is not None and gguf_file is None:
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         is_local = os.path.isdir(pretrained_model_name_or_path)
         # If the file is a local folder (but not in the HF_HOME cache, even if it's technically local)
+        # 在 transformers/src/transformers/utils/__init__.py 中定义了 
+        # SAFE_WEIGHTS_NAME = "model.safetensors"     WEIGHTS_NAME = "pytorch_model.bin"
+        # SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"    WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
+        
+        # 本地是否存在 pretrained_model_name_or_path 文件
         if is_local:
-            if transformers_explicit_filename is not None:
+            if transformers_explicit_filename is not None: # 从用户显式指定文件名直接加载；判断是否分页索引
                 # If the filename is explicitly defined, load this by default.
                 archive_file = os.path.join(pretrained_model_name_or_path, subfolder, transformers_explicit_filename)
                 is_sharded = transformers_explicit_filename.endswith(".safetensors.index.json")
-            elif use_safetensors is not False and os.path.isfile(
+                
+            elif use_safetensors is not False and os.path.isfile( # 从SAFE_WEIGHTS_NAME加载
                 os.path.join(pretrained_model_name_or_path, subfolder, _add_variant(SAFE_WEIGHTS_NAME, variant))
-            ):
+            ):  # _add_variant 方法只是拆分增加 variant 到文件名中。例如 'filename.bin' -> 'filename.variant.bin'
                 # Load from a safetensors checkpoint
                 archive_file = os.path.join(
                     pretrained_model_name_or_path, subfolder, _add_variant(SAFE_WEIGHTS_NAME, variant)
                 )
-            elif use_safetensors is not False and os.path.isfile(
+                
+            elif use_safetensors is not False and os.path.isfile( # 从SAFE_WEIGHTS_INDEX_NAME加载；是分页索引
                 os.path.join(pretrained_model_name_or_path, subfolder, _add_variant(SAFE_WEIGHTS_INDEX_NAME, variant))
             ):
                 # Load from a sharded safetensors checkpoint
                 archive_file = os.path.join(
                     pretrained_model_name_or_path, subfolder, _add_variant(SAFE_WEIGHTS_INDEX_NAME, variant)
                 )
-                is_sharded = True
-            elif not use_safetensors and os.path.isfile(
+                is_sharded = True # 是分片索引文件
+                
+            elif not use_safetensors and os.path.isfile( # 从WEIGHTS_NAME加载
                 os.path.join(pretrained_model_name_or_path, subfolder, _add_variant(WEIGHTS_NAME, variant))
             ):
                 # Load from a PyTorch checkpoint
                 archive_file = os.path.join(
                     pretrained_model_name_or_path, subfolder, _add_variant(WEIGHTS_NAME, variant)
                 )
-            elif not use_safetensors and os.path.isfile(
+                
+            elif not use_safetensors and os.path.isfile( # 从WEIGHTS_INDEX_NAME加载；是分页索引
                 os.path.join(pretrained_model_name_or_path, subfolder, _add_variant(WEIGHTS_INDEX_NAME, variant))
             ):
                 # Load from a sharded PyTorch checkpoint
                 archive_file = os.path.join(
                     pretrained_model_name_or_path, subfolder, _add_variant(WEIGHTS_INDEX_NAME, variant)
                 )
-                is_sharded = True
-            elif use_safetensors:
+                is_sharded = True # 是分片索引文件
+                
+            elif use_safetensors: # 本地找不到对应权重文件
                 raise OSError(
                     f"Error no file named {_add_variant(SAFE_WEIGHTS_NAME, variant)} found in directory"
                     f" {pretrained_model_name_or_path}."
                 )
-            else:
+                
+            else: # 本地找不到对应权重文件
                 raise OSError(
                     f"Error no file named {_add_variant(SAFE_WEIGHTS_NAME, variant)}, or {_add_variant(WEIGHTS_NAME, variant)},"
                     f" found in directory {pretrained_model_name_or_path}."
                 )
+        # 本地是否存在 subfolder + pretrained_model_name_or_path 文件
         elif os.path.isfile(os.path.join(subfolder, pretrained_model_name_or_path)):
             archive_file = pretrained_model_name_or_path
             is_local = True
         else:
+            # 非本地场景
             # set correct filename
             if transformers_explicit_filename is not None:
                 filename = transformers_explicit_filename
@@ -667,11 +684,16 @@ def _get_resolved_checkpoint_files(
                 "tqdm_class": tqdm_class,
                 **has_file_kwargs,
             }
-            can_auto_convert = (
-                not is_offline_mode()  # for obvious reasons
-                # If we are in a CI environment or in a pytest run, we prevent the conversion
+            
+            # 是否允许后台自动将仓库内的 pytorch_model.bin 在线转换为 .safetensors 缓存
+            can_auto_convert = ( # 同时满足以下四个条件才允许自动转换
+                # 离线模式下禁止联网拉取文件、禁止转换；转换需要读取仓库文件、写入本地缓存，断网无法执行
+                not is_offline_mode()
+                # 环境变量 DISABLE_SAFETENSORS_CONVERSION 可以全局关闭自动转换；生产环境、CI 流水线、容器内经常主动开启该变量，避免意外 IO、占用带宽
                 and not is_env_variable_true("DISABLE_SAFETENSORS_CONVERSION")
+                # remote_code 是自定义模型架构、自定义权重映射逻辑；自动转换 bot 无法通用解析自定义模型 state_dict，转换极易出错、产生损坏的 safetensors 文件
                 and not is_remote_code  # converter bot does not work on remote code
+                # 自动转换工具只支持仓库根目录权重，不支持子目录场景
                 and subfolder == ""  # converter bot does not work on subfolders
             )
 
@@ -772,6 +794,7 @@ def _get_resolved_checkpoint_files(
         else:
             logger.info(f"loading weights file {filename} from cache at {resolved_archive_file}")
 
+    # 分支二 GGUF模型分支（llama.cpp量化格式）
     elif gguf_file:
         # Case 1: the GGUF file is present locally
         if os.path.isfile(gguf_file):
@@ -832,6 +855,9 @@ def _get_dtype(
     1. If dtype is "auto", we try to read the config, else auto-detect dtype from the loaded state_dict, by checking
     its first weights entry that is of a floating type - we assume all floating dtype weights are of the same dtype
     2. Else, use the dtype provided as a dict or str
+    根据入参查找正确的dtype。同时基于这个dtype更新config。遵循以下规则：
+    1、如果dtype=auto，优先从config读取，否则从加载好的state_dict自动推断：通过找到第一个float类型的权重，假设所有浮点权重dtype一致
+    2、否则，使用提供的dtype字典或字符串
     """
     is_sharded = sharded_metadata is not None
 
@@ -1346,6 +1372,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
     def __init__(self, config: PreTrainedConfig, *inputs, **kwargs):
         super().__init__()
+        # 要求传入 config 是 PreTrainedConfig 的子类/实例
         if not isinstance(config, PreTrainedConfig):
             raise TypeError(
                 f"Parameter config in `{self.__class__.__name__}(config)` should be an instance of class "
@@ -1358,19 +1385,21 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         # Make kernel_config an attribute that can be used by the model.
         self.kernel_config = None
 
-        # Check the attention implementation is supported, or set it if not yet set (on the internal attr, to avoid
-        # setting it recursively)
+        # 校验传入的注意力实现方式是否真的能实现，否时逐步降级使用原生eager
         self.config._attn_implementation_internal = self._check_and_adjust_attn_implementation(
+            # 注意力机制实现方式（eager原生、sdpa、flash_attention_2、flash_attention_3等等）
+            # 传参形式 paged|xxx 或者 xxx，xxx 是注意力机制实现方式，paged 是后续算子优化是否分页相关的
             self.config._attn_implementation,
-            is_init_check=True,
+            # 是否是模型初始化阶段检查。初始化时权重还没放到设备，设备校验会放宽；`False`代表权重已经加载到设备，会做严格设备校验（如 FlashAttention 必须在 GPU）
+            is_init_check=True, 
             # We need to use this constant that is set through context manager as it cannot be forwarded in the model's __init__
-            allow_all_kernels=hub_kernels.ALLOW_ALL_KERNELS,
+            allow_all_kernels=hub_kernels.ALLOW_ALL_KERNELS, # 是否允许使用社区第三方 kernel
         )
-        # Check the experts implementation is supported, or set it if not yet set (on the internal attr, to avoid
-        # setting it recursively)
+        # 跟上面校验类似，判断 MOE 的实现方式，否时使用原生eager
         self.config._experts_implementation_internal = self._check_and_adjust_experts_implementation(
             self.config._experts_implementation
         )
+        # 判断模型能不能生成（cls.__bases__查看直接父类是不是 GenerationMixin 或者 模型有实现 can_generate 方法）
         if self.can_generate():
             # `from_model_config` is a legacy behavior -- we shouldn't set generation flags in the model config
             try:
@@ -1382,26 +1411,36 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         loss_type = self.__class__.__name__
         if loss_type not in LOSS_MAPPING:
             loss_groups = f"({'|'.join(LOSS_MAPPING)})"
-            loss_type = re.findall(loss_groups, self.__class__.__name__)
+            loss_type = re.findall(loss_groups, self.__class__.__name__)  # 用模型名找loss_type映射
             if len(loss_type) > 0:
                 loss_type = loss_type[0]
             else:
-                loss_type = None
+                loss_type = None # BertModel是没找到的
         self.loss_type = loss_type
 
-        _CAN_RECORD_REGISTRY[str(self.__class__)] = self._can_record_outputs  # added for executorch support only
+        _CAN_RECORD_REGISTRY[str(self.__class__)] = self._can_record_outputs  # 缓存下来后续如果有重复注册用
 
     def post_init(self):
         """
+        该方法在每个 Transformer 模型初始化流程的末尾执行，用于运行那些必须等模型所有子模块完整实例化完毕后才能执行的逻辑（例如权重初始化）。
+        对于组合式复合模型（多层嵌套模型），它还能让顶层模型正确获取全部静态属性：
+            并行策略、权重共享键列表、需保持 FP32 精度的模块列表等，保证顶层模型能感知下层子模块的相关配置。
         A method executed at the end of each Transformer model initialization, to execute code that needs the model's
         modules properly initialized (such as weight initialization).
         It is also used to obtain all correct static properties (parallelism plans, tied_weights_keys, _keep_in_fp32_modules, etc)
         correctly in the case of composite models (that is, the top level model should know about those properties from its children).
         """
-        # Attach the different parallel plans and tied weight keys to the top-most model, so that everything is
-        # easily available.
+        # Attach the different parallel plans and tied weight keys to the top-most model, so that everything is easily available.
+        # 将各类并行方案与绑定权重键挂载至顶层模型，确保所有组件均可便捷调用
+        # tp: Tensor Parallelism 张量并行规划。 把单一层大权重（如超大 Linear、Embedding）按列 / 行切分到多张 GPU，单卡显存压力降低
+        # ep: Expert Parallelism 专家并行（MoE 模型专用）。 混合专家模型中，不同 Expert 路由分配到不同显卡 
+        # pp: Pipeline Parallelism 流水线并行。 将 Transformer 多层 Encoder 分段，多卡接力执行前向传播，提升吞吐 
+        # fsdp: FSDP Fully Sharded Data Parallel 全分片数据并行。 分片优化器、梯度、模型权重，解决大模型单卡放不下问题
         self._tp_plan, self._ep_plan, self._pp_plan, self._fsdp_plan = {}, {}, {}, {}
+
         # If current model is a base model, attach `base_model_tp_plan` and `base_model_pp_plan` from config
+        # 只有当前模型本身是基础主干模型（BertModel、LlamaModel）时，才从config读取并行规划配置。参数是字典形式
+        # 非主干模型（基于主干包装出来的任务模型，BertForMaskedLM、LlamaForCausalLM）就复用主干模型的配置
         if self.base_model is self:
             self._pp_plan = self.config.base_model_pp_plan.copy() if self.config.base_model_pp_plan is not None else {}
             self._tp_plan = self.config.base_model_tp_plan.copy() if self.config.base_model_tp_plan is not None else {}
@@ -1410,21 +1449,34 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 self.config.base_model_fsdp_plan.copy() if self.config.base_model_fsdp_plan is not None else {}
             )
         # Current submodel should register its tied weights
+        # 共享权重：例如在BertForMaskedLM中，encoder部分的embedding层的权重能跟预测部分decoder的权重共享，两者维度和表征空间完全一致
+        # 获取需要共享权重的键，字符串列表形式，例如 [["bert.embeddings.word_embeddings.weight", "cls.predictions.decoder.weight"]]
         self.all_tied_weights_keys = self.get_expanded_tied_weights_keys(all_submodels=False)
-        # Current submodel should register its `_keep_in_fp32_modules`
+
+        # 开启混合精度加速时用到
+        # 模块内部权重自动维持FP32，前向自动类型转换，兼容半精度训练的模块名集合
         self._keep_in_fp32_modules = set(self._keep_in_fp32_modules or [])
+
+        # 全程保持 FP32 的模块名集合，不做自动类型转换，显存占用更高，仅数值极度敏感层使用
         self._keep_in_fp32_modules_strict = set(self._keep_in_fp32_modules_strict or [])
-        # Current submodel must register its `_no_split_modules`/`_skip_keys_device_placement` as well for device_map
+
+        # 不能分片，只能单卡计算的模块名集合，例如LayerNorm、激活层、各类预测头、残差块。管控模块，模块里面的参数都不能切分
         self._no_split_modules = set(self._no_split_modules or [])
+
+        # 匹配到的参数完全跳过整套设备分片/分配流程，不参与显存测算、不切分、不单独分配显卡，直接跟随模型主干主设备。例如共享权重、KV缓存(推理past_key_values)
         self._skip_keys_device_placement = set(self._skip_keys_device_placement or [])
+
         # Current submodel must register the `_keys_to_ignore_on_load_unexpected/missing`
-        self._keys_to_ignore_on_load_unexpected = set(self._keys_to_ignore_on_load_unexpected or [])
-        self._keys_to_ignore_on_load_missing = set(self._keys_to_ignore_on_load_missing or [])
-        self._keys_to_ignore_on_save = set(self._keys_to_ignore_on_save or [])
+        self._keys_to_ignore_on_load_unexpected = set(self._keys_to_ignore_on_load_unexpected or []) # 加载权重时不会报错的键
+        self._keys_to_ignore_on_load_missing = set(self._keys_to_ignore_on_load_missing or []) # 加载权重时丢失不会报错的键
+        # 保存权重时忽略的键。例如共享权重时只会保存第一个，后续不重复存储；KV缓存、optimizer状态、中间缓存buffer等等也不保存
+        self._keys_to_ignore_on_save = set(self._keys_to_ignore_on_save or []) 
 
         # Iterate over children only: as the final model is created, this is enough to gather the properties from all submodels.
         # This works because the way the `__init__` and `post_init` are called on all submodules is depth-first in the graph
-        for name, module in self.named_children():
+        # 因为模型初始化是depth-first深度优先遍历，所以当前模型初始化完成后，所有子模块的属性都已经被收集到当前模型中了
+        # 因此只需要遍历直接一级子模块就能拿到所有子模块的静态属性。
+        for name, module in self.named_children(): # 汇聚所有子模块的配置到主干模块
             # Parallel plans
             if plan := getattr(module, "_ep_plan", None):
                 self._ep_plan.update({f"{name}.{k}": v for k, v in plan.copy().items()})
@@ -1459,6 +1511,10 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # Maybe initialize the weights and tie the keys
         self.init_weights()
+
+        # 向后兼容梯度检查点。一次性变量，开启梯度检查后删除config.gradient_checkpointing，不写入配置
+        # 满足 self.supports_gradient_checkpointing && self.config.gradient_checkpointing 时，开启梯度检查点
+        # gradient_checkpointing 用来判断是否存储梯度中间值的开关。False时关闭梯度检查点，完整缓存所有层激活，默认训练行为
         self._backward_compatibility_gradient_checkpointing()
 
     @property
@@ -1932,6 +1988,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             `str`: The final attention implementation to use, including potential fallbacks from sdpa to eager, or from
             None to sdpa (to potentially eager).
         """
+        # 只是一个简单的字符串分割 paged|xxx。 paged开头=is_paged，|后面是注意力实现方式 sdpa、flash_attention等等
         is_paged, base_implementation = split_attention_implementation(attn_implementation)
 
         # A kernel the model explicitly lists in `_compatible_flash_implementations` is vouched for by
@@ -1957,7 +2014,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 )
                 attn_implementation = default_flash_implementation
 
-        is_paged, base_implementation = split_attention_implementation(attn_implementation)
+        is_paged, base_implementation = split_attention_implementation(attn_implementation) # 跟方法头部的字符串分割一样
 
         applicable_attn_implementation = attn_implementation
 
@@ -2456,6 +2513,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         initialization scheme, it should be overridden by the derived `PreTrainedModel` class. In case a model adds an explicit
         `nn.Parameter`, this method should also be overridden in order to initialize it correctly.
         """
+        # 一些配置字段取值兼容，当进入else时走兜底逻辑，可能是复合模型例如LlamaForCausalLM，其config没有这些初始化参数，要用主干基座的config
         if hasattr(self.config, "initializer_range"):
             std = self.config.initializer_range or 0.02
         elif hasattr(self.config, "init_std"):
@@ -2480,6 +2538,8 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         elif isinstance(module, nn.Embedding):
             init.normal_(module.weight, mean=0.0, std=std)
             # Here we need the check explicitly, as we slice the weight in the `zeros_` call, so it looses the flag
+            # _is_hf_initialized 属性是 HF 从 from_pretrained 入口加载权重时给所有权重张量添加的属性，值为 True。从零创建模型时不存在
+            # 作用是：从零创建 padding 行清零。加载预训练权重时，权重文件里已经存好了训练好的 embedding，不再重置。防止覆盖预训练好的 padding 向量
             if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
                 init.zeros_(module.weight[module.padding_idx])
         elif isinstance(module, nn.MultiheadAttention):
@@ -2498,11 +2558,13 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             if getattr(module, "bias", None) is not None:
                 init.zeros_(module.bias)
             # And the potential buffers for the BatchNorms
-            if getattr(module, "running_mean", None) is not None:
+            # BatchNorms有两类数据，1、可训练数据 w 和 b，2、buffers不参与梯度更新，属于滑动统计量
+            if getattr(module, "running_mean", None) is not None: # 初始化buffer
                 init.zeros_(module.running_mean)
                 init.ones_(module.running_var)
                 init.zeros_(module.num_batches_tracked)
         # This matches all the usual RotaryEmbeddings modules
+        # RoPE 旋转位置编码模块 LLaMA、Mistral、Qwen、Llama3 等主流解码器大模型全部使用，替代传统 Sinusoidal / Learnable 位置编码  后续
         elif "RotaryEmbedding" in module.__class__.__name__ and hasattr(module, "original_inv_freq"):
             rope_fn = (
                 ROPE_INIT_FUNCTIONS[module.rope_type]
@@ -2517,26 +2579,30 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         """
         Initialize the weights if they are not already initialized.
         """
+        # 如果已经初始化过，则不作处理，直接返回    _is_hf_initialized huggingface自定义的初始化标识
         if getattr(module, "_is_hf_initialized", False):
             return
 
         # This check is for remote code that does NOT use either `torch.init` or `transformers.initialization` in `_init_weights`
         # which allow to check the flag directly on param. As they don't and write the params in-place, params would be reinitialized
         # otherwise
+        # is_custom_code说明是用户自定义模块/层，如果该模块下   所有参数、buffer的 _is_hf_initialized 属性都为true，则不作初始化
+        # 对应后续 _init_weights 方法中 embedding层初始化判断 _is_hf_initialized 属性代码。如果为true说明权重来自预训练模型，不作初始化；否则初始化
         if (
             is_custom_code
             and all(getattr(param, "_is_hf_initialized", False) for param in module.parameters(recurse=False))
+            # 直属属性
             and all(
                 getattr(buffer, "_is_hf_initialized", False)
-                for buffer in module.buffers(recurse=False)
+                for buffer in module.buffers(recurse=False) # 直属buffer
                 if buffer is not None
             )
         ):
             module._is_hf_initialized = True
             return
 
-        self._init_weights(module)
-        module._is_hf_initialized = True
+        self._init_weights(module) # 不满足时执行初始化
+        module._is_hf_initialized = True # 初始化完打标
 
     @torch.no_grad()
     @init.guard_torch_init_functions()
@@ -2548,15 +2614,19 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         model would have to recurse a second time on all sub-models explicitly in the outer-most `_init_weights`, which
         is extremely error prone and inefficient.
         """
+        # 如果顶层Module没有这个方法就设置，代替原生的model.apply()，专门适配嵌套 PreTrainedModel 子模型
         if not hasattr(torch.nn.Module, "smart_apply"):
             # This function is equivalent to `torch.nn.Module.apply`, except that it dynamically adjust the function
             # to apply as we go down the graph
             def smart_apply(module: nn.Module, fn: Callable[[nn.Module, bool], None], is_custom_code: bool):
                 for child in module.children():
+                    # children() 直属一级子模块  modules() 所有层级子模块
                     # We found a sub-model: recursively dispatch its own init function now!
+                    # 如果子模块是完整预训练模型，就绑定子模块自己实现的权重初始化方法
                     if isinstance(child, PreTrainedModel):
                         smart_apply(child, child._initialize_weights, is_custom_code)
                     else:
+                    # 否则就是普通层，如 Linear/LayerNorm/Embedding/BertEncoding等等，用外层统一初始化函数
                         smart_apply(child, fn, is_custom_code)
                 fn(module, is_custom_code)
                 return module
@@ -2567,6 +2637,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         smart_apply_fn = getattr(self, "smart_apply")
         # `getattr(self, ...)` returns a bound method, so `self` is already provided as the receiver.
         smart_apply_fn(self._initialize_weights, self.is_custom_code())
+        # 外层统一初始化函数，由PreTrainModel提供
 
     def get_expanded_tied_weights_keys(self, all_submodels: bool = False) -> dict:
         r"""
@@ -2698,6 +2769,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if not recompute_mapping:
             tied_keys = self.all_tied_weights_keys
         else:
+            # 将 PreTrainedModel 中 self._tied_weights_keys 简写的数据，通过正则匹配展开成完整的、真实的参数名字典
             tied_keys = self.get_expanded_tied_weights_keys(all_submodels=True)
 
         tied_keys = list(tied_keys.items())
@@ -3256,10 +3328,13 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         initialization logic in `_init_weights`.
         """
         # If we are initializing on meta device, there is no point in trying to run inits
+        # meta的作用：零内存代价搭建完整神经网络骨架，只记录维度结构，不存储权重数值，专门解决超大模型初始化 OOM、预参数量估算、多卡分片自动分配问题
         if get_torch_context_manager_or_global_device() != torch.device("meta"):
+            # meta更多更详细作用待续
             # Initialize weights
             self.initialize_weights()
         # Tie weights needs to be called here, but it can use the pre-computed `all_tied_weights_keys`
+        # 绑定共享权重，initialize_weights方法已经遍历子模块获取过all_tied_weights_keys，传recompute_mapping=True就会重新获取
         self.tie_weights(recompute_mapping=False)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
@@ -3785,30 +3860,68 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         cls, dtype: torch.dtype, is_quantized: bool, _is_ds_init_called: bool, allow_all_kernels: bool | None
     ):
         # Need to instantiate with correct dtype
+        # 通用上下文处理，都是退出with时还原
+        # local_torch_dtype 
+        #   临时将上下文默认dtype设置为传入的dype，避免模型构造中出现混杂精度
+        # init.no_tie_weights 
+        #   原权重绑定方法（后续会提及）变成一个空方法
+        #       1、权重绑定推迟到模型构造完成之后
+        #       2、防止 meta device / ZeRO3 初始化时绑定张量引发报错、重复分配
+        #       3、低内存加载场景标准优化
+        # apply_patches 
+        #   transformers 内部补丁上下文，修补少量 torch 原生算子行为，适配 meta tensor、特殊算子兼容性
         init_contexts = [local_torch_dtype(dtype, cls.__name__), init.no_tie_weights(), apply_patches()]
+        
         # Needed as we cannot forward the `allow_all_kernels` arg in the model's __init__
-        if allow_all_kernels:
+        if allow_all_kernels: # 允许所有内核算子
             init_contexts.append(allow_all_hub_kernels())
+        # DeepSpeed Zero3 可用时
         if is_deepspeed_zero3_enabled():
             import deepspeed
 
             # We cannot initialize the model on meta device with deepspeed when not quantized
-            if not is_quantized and not _is_ds_init_called:
+            # 未开启量化时，不能配合 DeepSpeed 在 meta 设备上初始化模型。
+            if not is_quantized and not _is_ds_init_called: # 分支A：ZeRO‑3开启，非量化，并且尚未进入zero.Init（防嵌套）
                 logger.info("Detected DeepSpeed ZeRO-3: activating zero.init() for this model")
                 init_contexts.extend(
                     [
-                        init.no_init_weights(),
+                        # 构造 nn.Module 时不自动初始化参数，只创建空 Parameter 对象，配合 ZeRO3，避免在 CPU 预先分配权重（极大节省初始化内存）
+                        #   原生 nn.Module.__init__ 会调用子类 reset_parameters() 初始化权重（随机填充）
+                        #   该上下文全局打补丁：禁用所有模块的自动权重初始化
+                        #   配合 zero.Init 的意义：
+                        #       1、如果不禁用初始化，模块会尝试在创建参数时执行随机初始化
+                        #       2、触发张量内存分配，违背 ZeRO3「初始化阶段最小化内存占用」目标
+                        #       3、大量大模型会瞬间 OOM
+                        init.no_init_weights(), 
+                        # zero.Init() 是 DeepSpeed ZeRO Stage 3 专属上下文管理器，作用域内新建 nn.Parameter 遵循以下规则：
+                        #   1、不会立刻分配完整参数张量内存。
+                        #       普通 nn.Parameter() 会在当前设备创建张量占用内存。
+                        #       在 zero.Init() 中，创建空存储区 storage(容量等于0)，但保留 shape/dtype/device
+                        #   2、参数初始不填充随机权重
+                        #   3、模型构造完成后，执行 from_pretrained() 加载权重时，权重会被自动分片、分发到各个 ZeRO 进程，全程不需要出现「完整权重张量」
+                        #   4、ZeRO3 依靠这些预先创建好的空 Parameter 对象完成分片管理
+                        #   劫持 nn.Parameter 构造，生成 storage.size=0 的 CPU Parameter，注册到 ZeRO‑3 分片管理器。只处理 nn.Parameter，普通 Tensor 不受影响
+                        # zero.Init() 不能和 meta tensor / torch.device("meta") 混用
+                        #   ZeRO3 参数分片逻辑需要访问张量 storage，meta tensor 不存在 storage，直接导致运行时异常
+                        #   zero.Init() 不能与 meta tensor 混用的根本原因：meta tensor 无 storage，ZeRO3 需要张量存储对象追踪分片
                         deepspeed.zero.Init(config_dict_or_path=deepspeed_config()),
-                        set_zero3_state(),
+                        set_zero3_state(), # 纯 Python 状态标记，不修改张量。transformers 内部全局标记，告诉后续权重加载逻辑走对应分支
                     ]
                 )
-            elif is_quantized:
-                init_contexts.extend([torch.device("meta"), set_quantized_state()])
+            elif is_quantized: # 分支B：ZeRO‑3开启 + 量化模型(GPTQ/AWQ/BNB)
+                init_contexts.extend([
+                    torch.device("meta"), # 上下文，在此范围内创建的张量默认为 meta 设备，只有 shape/dtype，无 storage
+                    set_quantized_state() # 纯 Python 状态标记，不修改张量。transformers 内部全局标记，告诉后续权重加载逻辑走对应分支
+                ])
+        # 分支C：没有开启ZeRO‑3（DDP / 单卡）
         else:
             # meta_device_safe_creation_ops patches torch.linspace to default to CPU
             # so that custom models calling .item() during __init__ (e.g. drop-path
             # schedules) don't crash on meta tensors.
-            init_contexts.extend([torch.device("meta"), init.meta_device_safe_creation_ops()])
+            init_contexts.extend([
+                torch.device("meta"), # 上下文，在此范围内创建的张量默认为 meta 设备，只有 shape/dtype，无 storage
+                init.meta_device_safe_creation_ops() # meta 张量补丁，规避部分算子（`.item()`、linspace 等）直接抛异常，很多自定义模型__init__内部会调用这些算子
+            ])
 
         return init_contexts
 
@@ -4148,11 +4261,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if distributed_config is not None and tp_plan is None:
             tp_plan = "auto"
 
-        # Not used anymore -- remove them from the kwargs
+        # Not used anymore -- remove them from the kwargs 不再使用的配置
         for name in ["mirror", "_fast_init", "low_cpu_mem_usage", "from_tf", "from_flax", "offload_state_dict"]:
             _ = kwargs.pop(name, None)
 
-        # For BC on torch_dtype argument
+        # For BC on torch_dtype argument 向后兼容这个字段
         if torch_dtype is not None:
             dtype = dtype if dtype is not None else torch_dtype
         if dtype is None:
@@ -4172,35 +4285,81 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         }
         download_kwargs_with_commit = {**download_kwargs, "commit_hash": commit_hash}
 
+        # state_dict 参数和 pretrained_model_name_or_path/gguf_file 参数互斥
         if state_dict is not None and (pretrained_model_name_or_path is not None or gguf_file is not None):
             raise ValueError(
                 "`state_dict` cannot be passed together with a model name or a `gguf_file`. Use one of the two loading strategies."
             )
 
+        # device_map 是 Transformers 依托 Accelerate 实现的分层权重加载与设备分配策略
+        # 可取值: (str / dict[str])
+        # str形式时
+        #   None，默认值，全部权重先加载进 CPU 内存，加载完成后，你手动调用 model.to("cuda") 一次性迁移到目标设备。简单，适合单卡小模型。大模型容易OOM
+        #   cuda，尝试把整个模型完整放到 cuda:0。显存不足直接报错 OOM，不会自动 offload 到 CPU/磁盘
+        #   auto，最常用，自动检测所有可用 GPU，优先填满编号靠前的显卡，剩余显存不足时，自动 offload 到 CPU/磁盘（先内存再磁盘）。多卡容易负载不均
+        #   balanced，尽量均衡分配所有层到全部 GPU，让每张卡显存占用接近。OOM，不会自动 offload 到 CPU/磁盘
+        #   balanced_low_0，balanced基础上减少主卡占用，因为主卡还要进行数据预处理、采样、logits 计算、token 生成，预留显存给推理计算；模型权重少放一点
+        #   sequential，顺序填充：先塞满 cuda:0，再 cuda:1、cuda:2...跟 auto 的区别是不会自动 offload 到 CPU/磁盘
+        #   cpu，全部权重永久放在 CPU 内存，不使用 GPU。推理极慢，仅调试用
+        # dict[str]形式时
+        #   自定义分配策略，key 是层名，value 是设备名，如 {"embeddings": "cuda:0", "encoder": "cuda:1"}
+        #   有的时候传 {"": torch.device("cuda:0")}   {"": "cuda:1"}
+        #   key为空时是特批通配符，说明模型所有层，全部放到同一个目标设备
+        # 开启 device_map 后禁止调用 model.to() / model.cuda()，会打乱分层部署
         if device_map == "auto" and int(os.environ.get("WORLD_SIZE", "0")):
             logger.info(
                 "You've set device_map=`auto` while triggering a distributed run with torchrun. This might lead to unexpected behavior. "
                 "If your plan is to load the model on each device, you should set device_map={"
                 ": PartialState().process_index} where PartialState comes from accelerate library"
             )
-
+        # tp_plan: tensor paralelism plan 张量并行策略   tp_size: 张量并行的进程/GPU数量
+        # tp_plan传参格式: str / dict[str]
+        # dict[str] 例如: tp_plan = {
+        #     # Attention QKV 启用张量并行，按列切分
+        #     "model.layers.*.self_attn.q_proj": ColParallel,
+        #     "model.layers.*.self_attn.k_proj": ColParallel,
+        #     "model.layers.*.self_attn.v_proj": ColParallel,
+        #     # Attention output 按行切分
+        #     "model.layers.*.self_attn.o_proj": RowParallel,
+        #     # MLP 上下投影
+        #     "model.layers.*.mlp.up_proj": ColParallel,
+        #     "model.layers.*.mlp.gate_proj": ColParallel,
+        #     "model.layers.*.mlp.down_proj": RowParallel,
+        #     # 不参与TP，整层单卡放置
+        #     "model.embed_tokens": None,
+        #     "lm_head": None
+        # }
+        # str 例如:
+        # 常用字符串取值
+        # tp_plan = "all_layers"        # 所有transformer层启用TP，嵌入层/lm_head除外
+        # tp_plan = "transformer_only" # 和all_layers基本一致
+        # tp_plan = "attention_only"   # 只对自注意力开启TP，MLP不切分
+        # tp_plan = "none"              # 全局关闭张量并行，等价 tp_size=1
+        # tp_plan = "custom"            # 使用外部传入的自定义切分字典
         if tp_plan is not None or tp_size is not None:  # TP warnings, and setup
-            device_map, device_mesh, tp_size = initialize_tensor_parallelism(
-                tp_plan, tp_size=tp_size, device_mesh=device_mesh, device_map=device_map
-            )
+            # 校验参数，tp_size和tp_plan参数互斥，device_map和tp_plan互斥。
+            # 创建设备网格，并初始化张量并行（TP）通信后端，根据当前设备使用对应的tp，苹果不支持tp
+            device_map, device_mesh, tp_size = initialize_tensor_parallelism( # 一些参数校验
+            tp_plan, tp_size=tp_size, device_mesh=device_mesh, device_map=device_map 
+            ) # device_mesh 分布式设备网格  device_map 原始设备分配策略 DTensor相关，详情看笔记
 
-        if gguf_file is not None and not is_accelerate_available():
+        if gguf_file is not None and not is_accelerate_available(): # is_accelerate_available检验有没有装加速包和版本号
             raise ValueError("accelerate is required when loading a GGUF file `pip install accelerate`.")
 
         if adapter_kwargs is None:
             adapter_kwargs = {}
 
+        # peft Parameter-Efficient Fine-Tuning，HuggingFace官方配套库，参数高效微调  LoRA Low-Rand Adaptation 微调技术
+        # 读取基座模型的 commit_hash，如果 adapter_kwargs 的 _adapter_model_path 为空就尝试通过基座模型去查对应是 adapter 的 _adapter_model_path
         _adapter_model_path, pretrained_model_name_or_path, adapter_kwargs = maybe_load_adapters(
             pretrained_model_name_or_path,
             download_kwargs_with_commit,
             **adapter_kwargs,
-        )
-        device_map = check_and_set_device_map(device_map)  # warn, error and fix the device map
+        ) # 返回适配器路径、更新后的基座模型地址、清洗后的适配器参数
+        
+        # 接收用户传入的 device_map，统一标准化格式（字典形式）、做合法性校验、自动读取 Torch 全局 / 上下文设备，拦截各种冲突错误，
+        # 输出一套规范的 device_map 供给后续模型加载逻辑（from_pretrained）使用
+        device_map = check_and_set_device_map(device_map)  # warn, error and fix the device map   device_map取值上面有提及
 
         user_agent = {"file_type": "model", "framework": "pytorch", "from_auto_class": from_auto_class}
         if from_pipeline is not None:
@@ -4235,35 +4394,39 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # Because some composite configs call super().__init__ before instantiating the sub-configs, we need this call
         # to correctly redispatch recursively if the kwarg is provided
+        # 由于部分组合配置会在实例化子配置之前先执行 super().__init__，
+        # 因此当传入该关键字参数（kwarg）时，我们需要通过这一调用实现正确的递归分发
         if "attn_implementation" in kwargs:
             config._attn_implementation = kwargs.pop("attn_implementation")
-
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
 
+        # 查看在 AUTO_QUANTIZATION_CONFIG_MAPPING 映射中是否有对应当前配置的量化器
+        # 有的话就实例化并返回对应的量化器对象、根据量化器更新后的config、量化器对应的device_map
         hf_quantizer, config, device_map = get_hf_quantizer(
             config, quantization_config, device_map, weights_only, user_agent
         )
 
         if gguf_file:
-            if hf_quantizer is not None:
+            if hf_quantizer is not None: # gguf_file 和 hf_quantizer 互斥
                 raise ValueError(
                     "You cannot combine Quantization and loading a model from a GGUF file, try again by making sure you did not passed a `quantization_config` or that you did not load a quantized model from the Hub."
                 )
             if device_map is not None and (
                 (isinstance(device_map, dict) and "disk" in device_map.values()) or "disk" in device_map
-            ):
+            ):  # 磁盘负载（通过判断device_map存在某个层存放在磁盘） 跟 gguf 互斥
                 raise RuntimeError(
                     "One or more modules is configured to be mapped to disk. Disk offload is not supported for models "
                     "loaded from GGUF files."
                 )
 
-        if kernel_config is not None and not use_kernels:
+        if kernel_config is not None and not use_kernels: # 传入内核设置 kernel_config 同时 use_kernels 为 false 时，自动将 use_kernels 设为 true
             logger.warning_once(
                 "A kernel_config was provided but use_kernels is False; setting use_kernels=True automatically. To suppress this warning, explicitly set use_kernels to True."
             )
             use_kernels = True
 
+        # 只做权重文件定位、解析分片索引。不实际加载张量到内存
         checkpoint_files, sharded_metadata = _get_resolved_checkpoint_files(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             variant=variant,
@@ -4275,10 +4438,16 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             transformers_explicit_filename=getattr(config, "transformers_weights", None),
             tqdm_class=tqdm_class,
         )
+        # 非分片模式时 checkpoint_files = ["./model.safetensors"] sharded_metadata = None
+        # 分片模式时 checkpoint_files = ["./model-00001-of-00003.safetensors", "./model-00002-of-00003.safetensors"...] 
+        # sharded_metadata = { metadata: { total_size: 10240000 }, weight_map: { "model.embed_tokens.weight": "model-00001-of-00003.safetensors"... } }
 
         is_quantized = hf_quantizer is not None
 
         # Find the correct dtype based on current state
+        # _get_dtype根据入参查找正确的dtype。同时基于这个dtype更新config。遵循以下规则：
+        # 1、如果dtype=auto，优先从config读取，否则从sharded_metadata/state_dict/checkpoint_files自动推断：通过找到第一个float类型的权重，假设所有浮点权重dtype一致
+        # 2、否则，使用提供的dtype字典或字符串
         config, dtype = _get_dtype(
             dtype, checkpoint_files, config, sharded_metadata, state_dict, weights_only, hf_quantizer
         )
@@ -4309,18 +4478,21 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             register_fusion_patches(cls, config, fusion_config)
 
         # Kernel patches: single-layer replacement (stateful __init__) then fusions.
-        if kernel_config is not None and use_kernels:
+        if kernel_config is not None and use_kernels: # 都是来自kwargs
             from .integrations.hub_kernels import register_kernel_replacements_and_fusions
 
             # For remote kernels, we need to apply the context manager
             allow_all_kernels_context = [allow_all_hub_kernels()] if allow_all_kernels else []
             with ContextManagers(allow_all_kernels_context):
+                # 注册算子替换和融合
                 register_kernel_replacements_and_fusions(cls, config, kernel_config)
 
         model_init_context = cls.get_init_context(dtype, is_quantized, _is_ds_init_called, allow_all_kernels)
 
         config = copy.deepcopy(config)  # We do not want to modify the config inplace in from_pretrained.
         with ContextManagers(model_init_context):
+            # 调用对应类的构造方法。原型链是 nn.Module -> PreTrainedModel -> 对应类。因此会调用对应的构造方法
+            # PreTrainedModel.init(config) 要求 config 是 PreTrainedConfig 子类，否则报错
             model = cls(config, *model_args, **model_kwargs)
             patch_output_recorders(model)
 

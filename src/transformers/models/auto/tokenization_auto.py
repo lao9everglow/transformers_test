@@ -466,6 +466,9 @@ def _has_tekken_tokenizer_file(
 
 
 def tokenizer_class_from_name(class_name: str) -> type[Any] | None:
+    # Bloom tokenizer classes were removed but should map to the fast backend for BC （BC：Backward Compatibility，向后兼容）
+    # Bloom模型：2022年hugging face牵头的首个百亿级别，开源自回归多语言大模型，对标GPT-3。【官方不再迭代优化】
+    # 纯Decoder Transformer架构，176B、专属词表250k（占用大量显存，不再维护Bloom分词器的原因之一）、上下文2048（远小于当前的8k/32k）
     # Bloom tokenizer classes were removed but should map to the fast backend for BC
     if class_name in {"BloomTokenizer", "BloomTokenizerFast"}:
         return TokenizersBackend
@@ -481,23 +484,33 @@ def tokenizer_class_from_name(class_name: str) -> type[Any] | None:
 
     # V5: TOKENIZER_MAPPING_NAMES now maps to single strings, not tuples
     for module_name, tokenizer_class in TOKENIZER_MAPPING_NAMES.items():
+        # 匹配当前要加载的分词器类名
         if tokenizer_class == class_name:
+            # 查映射表，将模型类型转换为模块名称，modelName -> moduleName.modelName
             module_name = model_type_to_module_name(module_name)
             if (
+                # MoE Mixture of Experts 混合专家模型。直觉上有点像yolo，一个主干多个检测头。实际上只取topK个头，按需激活
                 module_name in ["mistral", "mistral3", "mixtral", "ministral", "ministral3", "pixtral", "voxtral"]
                 and class_name == "MistralCommonBackend"
             ):
+                # 第二个参数是包名，必传
                 module = importlib.import_module(".tokenization_mistral_common", "transformers")
             else:
                 module = importlib.import_module(f".{module_name}", "transformers.models")
             try:
                 result = getattr(module, class_name)
                 # BC v5: expose XxxFast alias and tokenization_*_fast submodule for pre-v5 remote code.
+                # 获取当前分词器类所在模块名 __module__，取不到则为 None。同时判断该模块是否已经加载进 sys.modules（已导入）
                 if (submod := getattr(result, "__module__", None)) and submod in sys.modules:
                     base_mod = sys.modules[submod]
+                    # 给模块新增 XxxFast 类别名。例：类名 MistralTokenizer → 新增 MistralTokenizerFast = MistralTokenizer
                     setattr(base_mod, result.__name__ + "Fast", result)
+                    # 注册虚拟 _fast 子模块，兼容旧版 import 写法
+                    # submod = transformers.models.mistral.tokenization_mistral
+                    # submod + "_fast" = transformers.models.mistral.tokenization_mistral_fast
+                    # 让 import xxx_fast 直接指向原模块，不会报模块不存在
                     sys.modules.setdefault(submod + "_fast", base_mod)
-                return result
+                return result # 返回最终分词器类
             except AttributeError:
                 continue
 
@@ -505,7 +518,6 @@ def tokenizer_class_from_name(class_name: str) -> type[Any] | None:
         if getattr(tokenizer, "__name__", None) == class_name:
             return tokenizer
 
-    # We did not find the class, but maybe it's because a dep is missing. In that case, the class will be in the main
     # We did not find the class, but maybe it's because a dep is missing. In that case, the class will be in the main
     # init and we return the proper dummy to get an appropriate error message.
     main_module = importlib.import_module("transformers")
@@ -719,9 +731,12 @@ class AutoTokenizer:
         tokenizer_type = kwargs.pop("tokenizer_type", None)
         trust_remote_code = kwargs.pop("trust_remote_code", None)
         gguf_file = kwargs.get("gguf_file")
+        # GGUF：GGML Universal Format（GGML 通用统一格式），是 GGML/GGJT 的下一代二进制模型格式。专门为量化大语言模型设计，主打轻量化、跨硬件。
 
-        # First, let's see whether the tokenizer_type is passed so that we can leverage it
+        # First, let's see whether the tokenizer_type is passed so that we can leverage(充分利用) it
+        # 参数有传入 tokenizer_type ，就尝试直接用对应的分词器
         if tokenizer_type is not None:
+            # 对应各种模型的tokenizer类名，293个key
             tokenizer_class_name = TOKENIZER_MAPPING_NAMES.get(tokenizer_type, None)
 
             if tokenizer_class_name is None:
@@ -730,6 +745,7 @@ class AutoTokenizer:
                     f"{', '.join(c for c in TOKENIZER_MAPPING_NAMES)}."
                 )
 
+            # 根据类名获取对应的类
             tokenizer_class = tokenizer_class_from_name(tokenizer_class_name)
 
             if tokenizer_class is None:
@@ -737,22 +753,27 @@ class AutoTokenizer:
 
             return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
 
-        if gguf_file:
+        if gguf_file: # 有gguf文件就使用gguf数据作为模型配置数据
             gguf_path = cached_file(pretrained_model_name_or_path, gguf_file, **kwargs)
             config_dict = load_gguf_checkpoint(gguf_path, return_tensors=False)["config"]
+            # 后续会根据模型 config.model_type 去匹配分词器
             config = AutoConfig.for_model(**config_dict)
         elif config is None:
             try:
-                config = AutoConfig.from_pretrained(
+                # 根据模型名/本地路径自动识别模型架构；下载/读取config.json配置文件；
+                # 自动匹配对应模型的Config类（BertConfig / LlamaConfig 等）；支持自定义代码模型（trust_remote_code=True）、本地缓存、参数覆盖
+                config = AutoConfig.from_pretrained( # 后续会根据模型 config.model_type 去匹配分词器
                     pretrained_model_name_or_path, trust_remote_code=trust_remote_code, **kwargs
-                )
+                ) # 方法里面也会跟 PreTrainedConfig.from_pretrained 一样调用到 PreTrainedConfig.get_config_dict
             except (ValueError, OSError):
+                # 兜底基础配置类，不做架构区分，仅读取原始字典，兼容无标准架构配置的场景
                 config = PreTrainedConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
         config_model_type = config.model_type
         config_model_name = config.model_name if hasattr(config, "model_name") else None
 
         # Next, let's try to use the tokenizer_config file to get the tokenizer class.
+        # 获取分词器配置文件
         tokenizer_config = get_tokenizer_config(pretrained_model_name_or_path, **kwargs)
         tokenizer_config_class = tokenizer_config.get("tokenizer_class", None)
 
@@ -774,6 +795,8 @@ class AutoTokenizer:
             and TokenizersBackend is not None
             and any(fnmatch.fnmatch(_config_name_or_path, p) for p in MODEL_IDS_TO_TOKENIZERS_BACKEND)
         ):
+            # 当自动映射找不到对应分词器、底层 Rust 分词库可用(TokenizersBackend)、模型属于通用匹配列表时(fnmatch.fnmatch通配符匹配)，
+            # 直接使用原生 TokenizersBackend 底层接口加载分词器，作为兜底兼容方案
             return TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
 
         # if there is a config, we can check that the tokenizer class != than model class.

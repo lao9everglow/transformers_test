@@ -664,6 +664,7 @@ def maybe_load_adapters(
     **adapter_kwargs,
 ):
     if pretrained_model_name_or_path is None or not is_peft_available():
+        # is_peft_available()判断有没有装包
         return None, pretrained_model_name_or_path, adapter_kwargs
 
     token = download_kwargs.get("token")

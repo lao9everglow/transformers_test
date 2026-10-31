@@ -241,10 +241,10 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin):
     base_model_pp_plan: ClassVar[dict[str, Sequence[list[str]]] | None] = None
     base_model_ep_plan: ClassVar[dict[str, Sequence[list[str]]] | None] = None
     _auto_class: ClassVar[str | None] = None
+    model_type: ClassVar[str] = ""
 
     # Attributes set internally when saving and used to infer model
     # class for `Auto` mapping
-    model_type: ClassVar[str] = ""
     transformers_version: str | None = None
     architectures: list[str] | None = None
 
@@ -701,14 +701,17 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin):
 
         """
         original_kwargs = copy.deepcopy(kwargs)
-        # Get config dict associated with the base config file
+        # 如果是gguf_file就从中读取配置，gguf文件读取方法中有一些模型配置字段兼容处理，也有一些共用权重配置(词嵌入层/输出层共享)处理
+        # 否则从本地文件夹 / 本地缓存 / hf Hub 拉取 config.json 文件。把 json 文件解析成 Python 字典，
+        # （字典数据处理，例如json中定义的-Infinity转成python对应的-inf，NAN转成nan等等）；
+        # 同时清洗、过滤、分离下载专用参数，返回更新后的 kwargs；因为下载专用参数不需要传给配置类构造函数
         config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
         if config_dict is None:
             return {}, kwargs
         if "_commit_hash" in config_dict:
             original_kwargs["_commit_hash"] = config_dict["_commit_hash"]
 
-        # That config file may point us toward another config file to use.
+        # That config file may point us toward another config file to use. 如果上面获取的配置中，配置文件字段指向另一个配置文件时，重读配置
         if "configuration_files" in config_dict:
             configuration_file = get_configuration_file(config_dict["configuration_files"])
             config_dict, kwargs = cls._get_config_dict(
@@ -757,8 +760,8 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin):
 
             try:
                 # Load from local folder or from cache or download from model Hub and cache
-                resolved_config_file = cached_file(
-                    pretrained_model_name_or_path,
+                resolved_config_file = cached_file( # transformers/src/transformers/models/auto/auto_factory.py下的
+                    pretrained_model_name_or_path,  # _BaseAutoModelClass.from_pretrained方法里面也有类似调用，返回缓存路径
                     configuration_file,
                     cache_dir=cache_dir,
                     force_download=force_download,
@@ -769,7 +772,7 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin):
                     revision=revision,
                     subfolder=subfolder,
                     _commit_hash=commit_hash,
-                )
+                ) # 返回路径形如 '/root/.cache/huggingface/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/config.json'
                 if resolved_config_file is None:
                     return None, kwargs
                 commit_hash = extract_commit_hash(resolved_config_file, commit_hash)
@@ -787,10 +790,10 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin):
                 )
 
         try:
-            if gguf_file:
+            if gguf_file: # 加载 GGUF 文件，并返回一个解析参数字典；该字典包含权重张量、解析后的分词器以及模型配置属性
                 config_dict = load_gguf_checkpoint(resolved_config_file, return_tensors=False)["config"]
             else:
-                # Load config dict
+                # 从本地或者缓存加载配置文件，里面还对特殊浮点值进行处理。例如保存在json中的Infinity/NAN转成python支持的inf和nan
                 config_dict = cls._dict_from_json_file(resolved_config_file)
 
             config_dict["_commit_hash"] = commit_hash
@@ -803,7 +806,8 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin):
             logger.info(f"loading configuration file {configuration_file} from cache at {resolved_config_file}")
 
         # timm models are not saved with the model_type in the config file
-        if "model_type" not in config_dict and is_timm_config_dict(config_dict):
+        if "model_type" not in config_dict and is_timm_config_dict(config_dict): 
+            # timm 开源Python库，专门提供海量预训练图像骨干网络（CNN、ViT、ConvNeXt、ResNet、MobileNet 等）
             config_dict["model_type"] = "timm_wrapper"
 
         # Some checkpoints may contain the wrong model_type in the config file.

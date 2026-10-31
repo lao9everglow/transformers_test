@@ -373,6 +373,7 @@ class AutoConfig:
         trust_remote_code = kwargs.pop("trust_remote_code", None)
         code_revision = kwargs.pop("code_revision", None)
 
+        # 参数有gguf_file就读取gguf_file内的配置，否则从本地缓存 或者 hugging face hub获取预训练模型的网络配置参数
         config_dict, unused_kwargs = PreTrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
         has_remote_code = "auto_map" in config_dict and "AutoConfig" in config_dict["auto_map"]
         has_local_code = "model_type" in config_dict and config_dict["model_type"] in CONFIG_MAPPING
@@ -387,12 +388,14 @@ class AutoConfig:
                 upstream_repo = None
             trust_remote_code = resolve_trust_remote_code(
                 trust_remote_code, pretrained_model_name_or_path, has_local_code, has_remote_code, upstream_repo
-            )
+            ) # 对远程自定义代码做安全提醒与用户确认，最终输出是否允许执行仓库内自定义模型代码的布尔开关
 
-        if has_remote_code and trust_remote_code and not explicit_local_code:
+        if has_remote_code and trust_remote_code and not explicit_local_code: # 存在远程自定义代码、允许信任远程代码、且不是本地显式自定义文件
             config_class = get_class_from_dynamic_module(
                 class_ref, pretrained_model_name_or_path, code_revision=code_revision, **kwargs
-            )
+            ) 
+            # 将自定义配置类注册到 AutoConfig 自动映射表。
+            # 后续再调用 AutoConfig.from_pretrained 时，能自动识别该模型的 model_type，不用额外指定类
             config_class.register_for_auto_class()
             return config_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
         elif "model_type" in config_dict:
@@ -404,7 +407,7 @@ class AutoConfig:
                 config_dict["model_type"] = "ministral"
 
             try:
-                config_class = CONFIG_MAPPING[config_dict["model_type"]]
+                config_class = CONFIG_MAPPING[config_dict["model_type"]] # 获取对应的配置类
             except KeyError:
                 raise ValueError(
                     f"The checkpoint you are trying to load has model type `{config_dict['model_type']}` "
@@ -416,7 +419,7 @@ class AutoConfig:
                     "Transformers from source with the command "
                     "`pip install git+https://github.com/huggingface/transformers.git`"
                 )
-            return config_class.from_dict(config_dict, **unused_kwargs)
+            return config_class.from_dict(config_dict, **unused_kwargs) # 只做字典 -> 配置对象的转换、兼容、校验，不涉及文件 IO
 
         raise ValueError(
             f"Unrecognized model in {pretrained_model_name_or_path}. "
