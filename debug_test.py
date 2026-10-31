@@ -3,7 +3,7 @@
 # # 读取bert配置，随机初始化权重
 # config = AutoConfig.from_pretrained("bert-base-uncased")
 # model = BertModel(config)  # 无预训练权重，随机初始化
-
+# test push
 
 # """
 from transformers import AutoModel, AutoTokenizer
